@@ -133,8 +133,14 @@ class MT5Connector:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
 
         before_drop = len(df)
+        cols_all_nan = [col for col in numeric_cols if df[col].isna().all()]
+        if cols_all_nan:
+            self._debug(f"Colunas 100% NaN em {label}: {cols_all_nan}")
+            return None
+
         df = df.dropna(subset=numeric_cols).copy()
         dropped = before_drop - len(df)
+        self._debug(f"Quantidade de linhas após dropna em {label}: {len(df)}")
         if dropped > 0:
             self._debug(f"Linhas removidas por NaN em {label}: {dropped}")
 
@@ -142,8 +148,8 @@ class MT5Connector:
         self._debug(f"{label} shape: {df.shape}")
         self._debug(f"{label} tail(3): {df.tail(3).to_dict(orient='records')}")
 
-        if len(df) < 60:
-            self._debug(f"DataFrame insuficiente para {label}: {len(df)} candles")
+        if len(df) < 30:
+            self._debug(f"DataFrame insuficiente para {label}: {len(df)} candles válidos (<30)")
             return None
         return df
 
@@ -194,11 +200,50 @@ class MT5Connector:
             self._debug("Snapshot abortado: df15 vazio antes dos indicadores")
             return None
 
+        if df15["close"].isna().all():
+            self._debug("Snapshot abortado: coluna close está 100% NaN antes do ADX")
+            return None
+
         df15 = df15.copy()
-        df15["ema20"] = df15["close"].ewm(span=20, adjust=False).mean()
-        df15["ema50"] = df15["close"].ewm(span=50, adjust=False).mean()
-        df15["atr14"] = self._atr(df15, 14)
-        df15["adx14"] = self._adx(df15, 14)
+
+        try:
+            df15["ema20"] = df15["close"].ewm(span=20, adjust=False).mean()
+            df15["ema50"] = df15["close"].ewm(span=50, adjust=False).mean()
+        except Exception as exc:
+            self._debug(f"Erro ao calcular EMA: {exc}")
+            return None
+
+        try:
+            df15["atr14"] = self._atr(df15, 14)
+        except Exception as exc:
+            self._debug(f"Erro ao calcular ATR: {exc}")
+            return None
+
+        try:
+            if df15["close"].isna().all():
+                self._debug("Abortado ADX: close ficou 100% NaN")
+                return None
+            df15["adx14"] = self._adx(df15, 14)
+        except Exception as exc:
+            self._debug(f"Erro ao calcular ADX: {exc}")
+            return None
+
+        rows_before_ind_drop = len(df15)
+        needed_cols = ["ema20", "ema50", "atr14", "adx14", "close", "high", "low"]
+        cols_all_nan_post = [col for col in needed_cols if df15[col].isna().all()]
+        if cols_all_nan_post:
+            self._debug(f"Colunas 100% NaN após indicadores: {cols_all_nan_post}")
+            return None
+
+        df15 = df15.dropna(subset=needed_cols).copy()
+        self._debug(f"Quantidade de linhas após dropna dos indicadores: {len(df15)}")
+        if len(df15) < 30:
+            self._debug("Snapshot abortado: menos de 30 candles válidos após indicadores")
+            return None
+        if rows_before_ind_drop - len(df15) > 0:
+            self._debug(
+                f"Linhas removidas após cálculo indicadores: {rows_before_ind_drop - len(df15)}"
+            )
 
         latest = df15.iloc[-1]
         previous = df15.iloc[-2]
