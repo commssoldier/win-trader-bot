@@ -112,7 +112,39 @@ class MT5Connector:
             self._debug(f"Candles insuficientes em {symbol}/{timeframe}")
             return None
         df = pd.DataFrame(rates)
+        if df.empty:
+            self._debug(f"DataFrame vazio após copy_rates para {symbol}/{timeframe}")
+            return None
         df["time"] = pd.to_datetime(df["time"], unit="s")
+        return self._normalize_ohlc_types(df, f"{symbol}/{timeframe}")
+
+
+    def _normalize_ohlc_types(self, df: pd.DataFrame, label: str) -> Optional[pd.DataFrame]:
+        """Garante tipagem numérica das colunas de candle e valida massa mínima."""
+        if df is None or df.empty:
+            self._debug(f"DataFrame vazio para {label}")
+            return None
+
+        numeric_cols = ["open", "high", "low", "close", "tick_volume"]
+        for col in numeric_cols:
+            if col not in df.columns:
+                self._debug(f"Coluna ausente em {label}: {col}")
+                return None
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+
+        before_drop = len(df)
+        df = df.dropna(subset=numeric_cols).copy()
+        dropped = before_drop - len(df)
+        if dropped > 0:
+            self._debug(f"Linhas removidas por NaN em {label}: {dropped}")
+
+        self._debug(f"{label} dtypes: {df.dtypes.to_dict()}")
+        self._debug(f"{label} shape: {df.shape}")
+        self._debug(f"{label} tail(3): {df.tail(3).to_dict(orient='records')}")
+
+        if len(df) < 60:
+            self._debug(f"DataFrame insuficiente para {label}: {len(df)} candles")
+            return None
         return df
 
     @staticmethod
@@ -155,6 +187,11 @@ class MT5Connector:
         df15 = self.get_rates_dataframe(symbol, mt5.TIMEFRAME_M15)
         df60 = self.get_rates_dataframe(symbol, mt5.TIMEFRAME_H1)
         if df5 is None or df15 is None or df60 is None:
+            self._debug("Snapshot abortado: um ou mais dataframes inválidos")
+            return None
+
+        if df15.empty:
+            self._debug("Snapshot abortado: df15 vazio antes dos indicadores")
             return None
 
         df15 = df15.copy()
