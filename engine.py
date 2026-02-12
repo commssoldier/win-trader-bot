@@ -1,12 +1,15 @@
 """Motor principal de decisão e ciclo de execução."""
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date
-from typing import Callable
+from typing import Callable, Optional
 
 from equity_tracker import EquityTracker
 from execution_manager import ExecutionManager
+from mt5_connector import MT5Connector
 from profile_manager import StrategyProfile
 from regime_detector import RegimeDetector
 from report_generator import ReportGenerator
@@ -28,13 +31,21 @@ class TradingEngine:
     def __init__(
         self,
         logger,
+        connector: MT5Connector,
         execution_manager: ExecutionManager,
         profile: StrategyProfile,
         capital: float,
+        symbol: str = "WIN$",
+        debug_mode: bool = False,
+        debug_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.logger = logger
+        self.connector = connector
         self.execution = execution_manager
         self.profile = profile
+        self.symbol = symbol
+        self.debug_mode = debug_mode
+        self._debug_callback = debug_callback
         self.window = TradingWindow()
         self.risk = RiskManager(capital, profile)
         self.regime_detector = RegimeDetector()
@@ -43,24 +54,39 @@ class TradingEngine:
         self.equity = EquityTracker()
         self.state = EngineState()
         self.drawdown = 0.0
+        self._last_processed_candle = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def _debug(self, message: str) -> None:
+        if not self.debug_mode:
+            return
+        payload = f"[DEBUG] {message}"
+        self.logger.info(payload)
+        if self._debug_callback:
+            self._debug_callback(payload)
 
     def can_trade(self) -> tuple[bool, str]:
         now = now_b3()
         if is_expiration_day(now.date()):
-            return False, "Dia de vencimento"
+            return True, "Dia de vencimento"
         if not is_within_trading_window(now, self.window):
-            return False, "Fora do horário de operação"
-        return self.risk.should_block()
+            return True, "Fora do horário operacional (10:00–17:00)."
+        blocked, reason = self.risk.should_block()
+        return blocked, reason
 
-    def process_market_snapshot(self, data: dict) -> None:
+    def process_market_snapshot(self, data: dict, contracts: int) -> None:
         blocked, reason = self.can_trade()
         if blocked:
             self.state.blocked_reason = reason
+            self._debug(f"Bloqueado por: {reason}")
             return
 
         current_atr = data["atr15"]
         if self.vol_filter.is_extreme(data["atr_series"], current_atr):
             self.state.current_regime = "PAUSADO"
+            self.state.blocked_reason = "Volatilidade extrema"
+            self._debug("Bloqueado por volatilidade extrema")
             return
 
         signal = self.regime_detector.classify(
@@ -73,12 +99,117 @@ class TradingEngine:
             vol_extreme=False,
         )
         self.state.current_regime = signal.regime
+        self.state.blocked_reason = ""
 
         if signal.regime == "TENDENCIA":
             stop_pts, take_pts = self.risk.compute_stop_take_points(current_atr)
             side = "BUY" if signal.direction == "COMPRA" else "SELL"
             mode = "market" if data.get("breakout", True) else "limit"
-            self.execution.send_order(side, data["contracts"], stop_pts, take_pts, mode)
+            self.execution.send_order(side, contracts, stop_pts, take_pts, mode)
+
+    def run_loop(
+        self,
+        contracts: int,
+        status_callback: Callable[[str], None],
+        regime_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        """Loop contínuo: executa somente em candle fechado de 15m."""
+        self.state.running = True
+        self._stop_event.clear()
+        self._debug("Thread do engine iniciada")
+        self._debug("Loop ativo")
+        status_callback("ENGINE RODANDO")
+
+        while not self._stop_event.is_set():
+            try:
+                now = now_b3()
+                inside_window = is_within_trading_window(now, self.window)
+                self._debug(f"Loop tick: {now.strftime('%H:%M:%S')}")
+                self._debug(f"Dentro do horário: {inside_window}")
+                self._debug(f"Estado da thread ativa: {self.state.running}")
+                self._debug(f"Último candle 15m processado: {self._last_processed_candle}")
+
+                connected = self.connector.ensure_connection()
+                self._debug(f"Resultado conexão MT5: {connected}")
+                if not connected:
+                    status_callback("DESCONECTADO")
+                    time.sleep(2)
+                    continue
+
+                blocked, reason = self.can_trade()
+                if blocked:
+                    self._debug(f"Bloqueio detectado: {reason}")
+                if blocked and reason == "Fora do horário operacional (10:00–17:00).":
+                    self.logger.info(reason)
+                    self._debug("Fora do horário operacional")
+                    status_callback("AGUARDANDO HORÁRIO")
+                    time.sleep(5)
+                    continue
+
+                snapshot = self.connector.build_market_snapshot(self.symbol)
+                if not snapshot:
+                    time.sleep(2)
+                    continue
+
+                candle_time = snapshot["last_candle_time_15m"]
+                if self._last_processed_candle == candle_time:
+                    time.sleep(2)
+                    continue
+
+                self._last_processed_candle = candle_time
+                self._debug(f"Novo candle 15m detectado: {candle_time.strftime('%H:%M')}")
+
+                self.process_market_snapshot(snapshot, contracts)
+                status_callback(f"Regime: {self.state.current_regime}")
+                if regime_callback:
+                    regime_callback(self.state.current_regime)
+
+                result_reais = points_to_reais(self.risk.result_points)
+                self._debug(f"Regime: {self.state.current_regime}")
+                self._debug(
+                    f"ADX15: {snapshot['adx15']:.2f} | ATR15: {snapshot['atr15']:.2f} | "
+                    f"EMA20: {snapshot['ema20']:.2f} | EMA50: {snapshot['ema50']:.2f}"
+                )
+                self._debug(
+                    f"Resultado parcial do dia: {self.risk.result_points:.2f} pts | R$ {result_reais:.2f}"
+                )
+
+                self.logger.info(
+                    "Regime atual: %s | ADX: %.2f | ATR15: %.2f",
+                    self.state.current_regime,
+                    snapshot["adx15"],
+                    snapshot["atr15"],
+                )
+
+                time.sleep(1)
+            except Exception as exc:
+                self.logger.exception("Erro no loop principal: %s", exc)
+                self._debug(f"Erro de loop: {exc}")
+                status_callback("ERRO NO LOOP")
+                time.sleep(2)
+
+        self.state.running = False
+        self._debug("Evento stop recebido")
+        self._debug("Thread encerrada")
+        status_callback("ENGINE PARADA")
+
+    def start(
+        self,
+        contracts: int,
+        status_callback: Callable[[str], None],
+        regime_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        """Inicia loop contínuo em thread separada."""
+        if self.state.running:
+            return
+        self._debug("Thread do engine iniciada")
+        self._thread = threading.Thread(
+            target=self.run_loop,
+            args=(contracts, status_callback, regime_callback),
+            daemon=True,
+            name="win-engine-loop",
+        )
+        self._thread.start()
 
     def update_daily_result(self, result_points: float) -> None:
         self.risk.register_trade_result(result_points)
@@ -115,13 +246,8 @@ class TradingEngine:
         self.equity.export_csv(self.reports.base / f"{base_name}_equity.csv")
         self.equity.export_monthly_stats(self.reports.base / f"{base_name}_monthly_stats.csv")
 
-    def start(self, on_tick: Callable[[], None]) -> None:
-        self.state.running = True
-        try:
-            on_tick()
-        except Exception as exc:
-            self.logger.exception("Erro no loop principal: %s", exc)
-            self.state.running = False
-
     def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
         self.state.running = False

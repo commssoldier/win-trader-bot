@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox, ttk
 
 from engine import TradingEngine
 from execution_manager import ExecutionManager
 from mt5_connector import MT5Connector
 from profile_manager import ProfileManager
-from utils import max_contracts
+from utils import DEBUG_MODE, TradingWindow, is_within_trading_window, max_contracts, now_b3
 
 
 class TradingBotGUI:
@@ -23,6 +23,7 @@ class TradingBotGUI:
         self.connector = MT5Connector(logger)
         self.profile_manager = ProfileManager()
         self.engine: TradingEngine | None = None
+        self.window = TradingWindow()
 
         self.env_var = tk.StringVar(value="Demo")
         self.login_var = tk.StringVar()
@@ -32,6 +33,7 @@ class TradingBotGUI:
         self.profile_var = tk.StringVar(value="Moderado")
         self.capital_var = tk.StringVar(value="10000")
         self.contracts_var = tk.StringVar(value="1")
+        self.max_contracts_var = tk.StringVar(value="Máx contratos: 5")
         self.meta_var = tk.StringVar(value="0.012")
         self.stop_var = tk.StringVar(value="0.01")
         self.atr_mult_var = tk.StringVar(value="1.8")
@@ -39,9 +41,12 @@ class TradingBotGUI:
         self.adx_min_var = tk.StringVar(value="20")
         self.risk_var = tk.StringVar(value="0.01")
         self.expand_var = tk.BooleanVar(value=False)
+        self.debug_var = tk.BooleanVar(value=DEBUG_MODE)
         self.regime_var = tk.StringVar(value="NEUTRO")
 
         self._build_layout()
+        self.capital_var.trace_add("write", lambda *_: self._refresh_contract_limit())
+        self._refresh_contract_limit()
 
     def _build_layout(self) -> None:
         frame = ttk.Frame(self.root, padding=12)
@@ -72,7 +77,9 @@ class TradingBotGUI:
         ttk.Entry(setup, textvariable=self.capital_var, width=12).grid(row=0, column=3)
         ttk.Label(setup, text="Contratos").grid(row=0, column=4, sticky="w")
         ttk.Entry(setup, textvariable=self.contracts_var, width=8).grid(row=0, column=5)
-        ttk.Checkbutton(setup, text="Ativar expansão de meta", variable=self.expand_var).grid(row=0, column=6, sticky="w")
+        ttk.Label(setup, textvariable=self.max_contracts_var).grid(row=0, column=6, sticky="w", padx=(8, 0))
+        ttk.Checkbutton(setup, text="Ativar expansão de meta", variable=self.expand_var).grid(row=0, column=7, sticky="w")
+        ttk.Checkbutton(setup, text="Modo Debug", variable=self.debug_var).grid(row=0, column=8, sticky="w")
 
         fields = [
             ("Meta %", self.meta_var),
@@ -98,7 +105,28 @@ class TradingBotGUI:
         self.logs = tk.Text(logs_frame, height=18)
         self.logs.pack(fill="both", expand=True)
 
+    def _refresh_contract_limit(self) -> None:
+        try:
+            capital = float(self.capital_var.get())
+        except ValueError:
+            self.max_contracts_var.set("Máx contratos: 0")
+            return
+        max_ct = max_contracts(capital)
+        self.max_contracts_var.set(f"Máx contratos: {max_ct}")
+
+    def _update_runtime_status(self, text: str) -> None:
+        self.root.after(0, lambda: self.status_var.set(text))
+
+    def _update_regime(self, regime: str) -> None:
+        self.root.after(0, lambda: self.regime_var.set(regime))
+
+    def _debug(self, message: str) -> None:
+        if self.debug_var.get():
+            self._log(f"[DEBUG] {message}")
+
     def connect(self) -> None:
+        self.connector.set_debug(self.debug_var.get(), callback=self._log if self.debug_var.get() else None)
+        self._debug(f"Modo Debug ativo: {self.debug_var.get()}")
         try:
             ok = self.connector.connect(int(self.login_var.get()), self.password_var.get(), self.server_var.get())
         except ValueError:
@@ -120,21 +148,42 @@ class TradingBotGUI:
             self._log("Falha ao conectar ao MT5.")
 
     def disconnect(self) -> None:
+        self.stop_bot()
         self.connector.disconnect()
         self.status_var.set("Desconectado")
         self.status_lbl.configure(foreground="black")
         self._log("Conexão encerrada.")
 
     def start_bot(self) -> None:
+        self._debug("start_bot() acionado")
         if not self.connector.status.connected:
             messagebox.showwarning("Aviso", "Conecte ao MT5 antes de iniciar.")
             return
 
-        capital = float(self.capital_var.get())
+        try:
+            capital = float(self.capital_var.get())
+            contracts = int(self.contracts_var.get())
+        except ValueError:
+            messagebox.showerror("Erro", "Capital e contratos devem ser numéricos.")
+            return
+
         max_ct = max_contracts(capital)
-        contracts = int(self.contracts_var.get())
+        self._debug(f"Capital informado: {capital}")
+        self._debug(f"Contratos solicitados: {contracts}")
+        self._debug(f"Máx contratos permitidos: {max_ct}")
+
+        if max_ct <= 0:
+            messagebox.showerror("Erro", "Capital insuficiente. Mínimo R$ 2000 para 1 contrato.")
+            return
         if contracts > max_ct:
             messagebox.showerror("Erro", f"Contratos acima do máximo permitido ({max_ct}).")
+            return
+
+        now = now_b3()
+        if not is_within_trading_window(now, self.window):
+            self._log("Fora do horário operacional (10:00–17:00).")
+            self._debug("Fora do horário operacional")
+            self.status_var.set("AGUARDANDO HORÁRIO")
             return
 
         overrides = {
@@ -147,13 +196,31 @@ class TradingBotGUI:
         }
         profile = self.profile_manager.get_profile(self.profile_var.get(), overrides)
 
-        self.engine = TradingEngine(self.logger, ExecutionManager(self.logger), profile, capital)
+        self.connector.set_debug(self.debug_var.get(), callback=self._log if self.debug_var.get() else None)
+        self.engine = TradingEngine(
+            self.logger,
+            self.connector,
+            ExecutionManager(self.logger),
+            profile,
+            capital,
+            debug_mode=self.debug_var.get(),
+            debug_callback=self._log if self.debug_var.get() else None,
+        )
         self.engine.risk.expansion_enabled = self.expand_var.get()
-        self._log("Robô iniciado com perfil: %s" % profile.name)
+        self._debug("TradingEngine instanciado com MT5Connector atual")
+        self.engine.start(
+            contracts=contracts,
+            status_callback=self._update_runtime_status,
+            regime_callback=self._update_regime,
+        )
+        self._debug("Engine.start() chamado")
+        self._log(f"Robô iniciado com perfil: {profile.name}")
 
     def stop_bot(self) -> None:
+        self._debug("stop_bot() acionado")
         if self.engine:
             self.engine.stop()
+            self._debug("Thread finalizada com sucesso")
             self._log("Robô parado.")
 
     def _log(self, text: str) -> None:

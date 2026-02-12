@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 
 B3_TZ = ZoneInfo("America/Sao_Paulo")
 WIN_POINT_VALUE = 0.20
+# Flag temporária para instrumentação detalhada do Bloco A.
+DEBUG_MODE = True
 
 
 @dataclass
@@ -54,5 +56,7 @@ def points_to_reais(points: float) -> float:
 
 
 def max_contracts(capital: float) -> int:
-    """Calcula quantidade máxima de contratos por capital."""
-    return max(1, floor(capital / 2000.0))
+    """Calcula quantidade máxima de contratos por capital usando floor(capital/2000)."""
+    if capital <= 0:
+        return 0
+    return floor(capital / 2000.0)
