@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 import MetaTrader5 as mt5
+import numpy as np
 import pandas as pd
 
 
@@ -130,7 +131,7 @@ class MT5Connector:
             if col not in df.columns:
                 self._debug(f"Coluna ausente em {label}: {col}")
                 return None
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
 
         before_drop = len(df)
         cols_all_nan = [col for col in numeric_cols if df[col].isna().all()]
@@ -155,38 +156,38 @@ class MT5Connector:
 
     def _adx(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
         """Calcula ADX usando apenas pandas.Series explícitas."""
-        high: pd.Series = df["high"].astype(float)
-        low: pd.Series = df["low"].astype(float)
-        close: pd.Series = df["close"].astype(float)
+        high: pd.Series = df["high"].astype("float64")
+        low: pd.Series = df["low"].astype("float64")
+        close: pd.Series = df["close"].astype("float64")
 
         up_move: pd.Series = high.diff()
         down_move: pd.Series = -low.diff()
 
-        plus_dm: pd.Series = up_move.where((up_move > down_move) & (up_move > 0), 0.0).astype(float)
-        minus_dm: pd.Series = down_move.where((down_move > up_move) & (down_move > 0), 0.0).astype(float)
+        plus_dm: pd.Series = up_move.where((up_move > down_move) & (up_move > 0), 0.0).astype("float64")
+        minus_dm: pd.Series = down_move.where((down_move > up_move) & (down_move > 0), 0.0).astype("float64")
 
-        tr1: pd.Series = (high - low).astype(float)
-        tr2: pd.Series = (high - close.shift()).abs().astype(float)
-        tr3: pd.Series = (low - close.shift()).abs().astype(float)
-        tr: pd.Series = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).astype(float)
+        tr1: pd.Series = (high - low).astype("float64")
+        tr2: pd.Series = (high - close.shift()).abs().astype("float64")
+        tr3: pd.Series = (low - close.shift()).abs().astype("float64")
+        tr: pd.Series = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).astype("float64")
 
         self._debug(f"type(tr)={type(tr)}")
         self._debug(f"type(plus_dm)={type(plus_dm)}")
 
-        atr: pd.Series = tr.ewm(alpha=1 / period, adjust=False).mean().astype(float)
+        atr: pd.Series = tr.ewm(alpha=1 / period, adjust=False).mean().astype("float64")
         plus_di: pd.Series = (
-            100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, pd.NA))
-        ).astype(float)
+            100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, np.nan))
+        ).astype("float64")
         minus_di: pd.Series = (
-            100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, pd.NA))
-        ).astype(float)
+            100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, np.nan))
+        ).astype("float64")
 
         dx: pd.Series = (
-            ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
-        ).astype(float)
+            ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
+        ).astype("float64")
         self._debug(f"type(dx)={type(dx)}")
 
-        adx: pd.Series = dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0).astype(float)
+        adx: pd.Series = dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0).astype("float64")
         return adx
 
 
@@ -238,7 +239,12 @@ class MT5Connector:
                 self._debug("Abortado ADX: close ficou 100% NaN")
                 return None
             self._debug(f"Series close para ADX: {type(df15['close'])}")
-            df15["adx14"] = self._adx(df15, 14)
+            adx_series = self._adx(df15, 14)
+            adx_last = adx_series.iloc[-1]
+            if pd.isna(adx_last):
+                self._debug("ADX final é NaN/NA")
+                return None
+            df15["adx14"] = adx_series
         except Exception as exc:
             self._debug(f"Erro ao calcular ADX: {exc}")
             return None
@@ -270,7 +276,7 @@ class MT5Connector:
             "adx15": float(latest["adx14"]),
             "ema20": float(latest["ema20"]),
             "ema50": float(latest["ema50"]),
-            "atr_series": df15["atr14"].tail(80).astype(float).tolist(),
+            "atr_series": df15["atr14"].tail(80).astype("float64").tolist(),
             "range20": float(rng20),
             "breakout": bool(latest["close"] > previous["high"] or latest["close"] < previous["low"]),
             "pullback": bool(df5["close"].iloc[-1] < df5["high"].tail(5).max()),
