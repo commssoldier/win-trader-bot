@@ -59,7 +59,7 @@ class TradingEngine:
         self._debug_callback = debug_callback
         self.window = TradingWindow()
         self.risk = RiskManager(capital, profile)
-        self.regime_detector = RegimeDetector()
+        self.regime_detector = RegimeDetector(debug_mode=debug_mode, debug_callback=debug_callback)
         self.vol_filter = VolatilityFilter()
         self.reports = ReportGenerator()
         self.equity = EquityTracker()
@@ -145,19 +145,11 @@ class TradingEngine:
             self._debug("Bloqueado por volatilidade extrema")
             return
 
-        signal = self.regime_detector.classify(
-            adx15=snapshot["adx15"],
-            ema20=snapshot["ema20"],
-            ema50=snapshot["ema50"],
-            limit_trend=self.profile.adx_min,
-            limit_range=18.0,
-            range20=snapshot["range20"],
-            vol_extreme=False,
-        )
+        signal = self.regime_detector.classify(snapshot)
         self.state.current_regime = signal.regime
         self.state.blocked_reason = ""
 
-        if signal.regime != "TENDENCIA":
+        if signal.regime not in {"TENDENCIA_FORTE", "TENDENCIA_FRACA"}:
             return
 
         close_price = snapshot["close_15m"]

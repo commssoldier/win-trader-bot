@@ -224,12 +224,16 @@ class MT5Connector:
         try:
             df15["ema20"] = df15["close"].ewm(span=20, adjust=False).mean()
             df15["ema50"] = df15["close"].ewm(span=50, adjust=False).mean()
+            df60 = df60.copy()
+            df60["ema20"] = df60["close"].ewm(span=20, adjust=False).mean()
+            df60["ema50"] = df60["close"].ewm(span=50, adjust=False).mean()
         except Exception as exc:
             self._debug(f"Erro ao calcular EMA: {exc}")
             return None
 
         try:
             df15["atr14"] = self._atr(df15, 14)
+            df60["atr14"] = self._atr(df60, 14)
         except Exception as exc:
             self._debug(f"Erro ao calcular ATR: {exc}")
             return None
@@ -245,6 +249,13 @@ class MT5Connector:
                 self._debug("ADX final é NaN/NA")
                 return None
             df15["adx14"] = adx_series
+
+            adx60_series = self._adx(df60, 14)
+            adx60_last = adx60_series.iloc[-1]
+            if pd.isna(adx60_last):
+                self._debug("ADX60 final é NaN/NA")
+                return None
+            df60["adx14"] = adx60_series
         except Exception as exc:
             self._debug(f"Erro ao calcular ADX: {exc}")
             return None
@@ -267,18 +278,27 @@ class MT5Connector:
             )
 
         latest = df15.iloc[-1]
+
+        if len(df15) < 24 or len(df60) < 24:
+            self._debug("Snapshot abortado: histórico insuficiente para inclinações 15m/60m")
+            return None
         previous = df15.iloc[-2]
         rng20 = (df15["high"].tail(20).max() - df15["low"].tail(20).min()) if len(df15) >= 20 else 0.0
-        max_high_5 = float(df15["high"].tail(5).max())
-        min_low_5 = float(df15["low"].tail(5).min())
+        max_high_5 = float(df15["high"].iloc[-6:-1].max())
+        min_low_5 = float(df15["low"].iloc[-6:-1].min())
         vol_avg20 = float(df15["tick_volume"].tail(20).mean()) if len(df15) >= 20 else float(df15["tick_volume"].mean())
+
+        latest60 = df60.iloc[-1]
 
         return {
             "last_candle_time_15m": latest["time"],
             "atr15": float(latest["atr14"]),
+            "atr15_prev": float(df15["atr14"].iloc[-2]),
+            "atr15_mean20": float(df15["atr14"].tail(20).mean()),
             "adx15": float(latest["adx14"]),
             "ema20": float(latest["ema20"]),
             "ema50": float(latest["ema50"]),
+            "ema20_15_prev3": float(df15["ema20"].iloc[-4]),
             "close_15m": float(latest["close"]),
             "high_15m": float(latest["high"]),
             "low_15m": float(latest["low"]),
@@ -290,5 +310,10 @@ class MT5Connector:
             "range20": float(rng20),
             "breakout": bool(latest["close"] > previous["high"] or latest["close"] < previous["low"]),
             "pullback": bool(df5["close"].iloc[-1] < df5["high"].tail(5).max()),
-            "macro_context": "ALTA" if df60["close"].iloc[-1] > df60["close"].ewm(span=20, adjust=False).mean().iloc[-1] else "BAIXA",
+            "macro_context": "ALTA" if latest60["ema20"] > latest60["ema50"] else "BAIXA",
+            "ema20_60": float(latest60["ema20"]),
+            "ema50_60": float(latest60["ema50"]),
+            "ema20_60_prev3": float(df60["ema20"].iloc[-4]),
+            "atr60": float(latest60["atr14"]),
+            "adx60": float(latest60["adx14"]),
         }
