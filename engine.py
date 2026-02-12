@@ -71,6 +71,8 @@ class TradingEngine:
 
         self.active_position: SimulatedPosition | None = None
         self.simulated_trades_opened = 0
+        self._last_signal = None
+        self._last_5m_log_marker: tuple[int, int] | None = None
 
     def _debug(self, message: str) -> None:
         if not self.debug_mode:
@@ -85,6 +87,72 @@ class TradingEngine:
         self.logger.info(payload)
         if self._debug_callback:
             self._debug_callback(payload)
+
+
+    def _log_startup(self, contracts: int) -> None:
+        status = "OK" if self.connector.status.connected else "DESCONECTADO"
+        self.logger.info(
+            "[STARTUP] %s | simbolo=%s | perfil=%s | capital=%.2f | contratos=%s | "
+            "timeframes=5m,15m,60m | mt5=%s | debug=%s",
+            now_b3().strftime("%Y-%m-%d %H:%M:%S"),
+            self.symbol,
+            self.profile.name,
+            self.risk.capital,
+            contracts,
+            status,
+            "on" if self.debug_mode else "off",
+        )
+
+    def _log_15m_event(self, snapshot: dict) -> None:
+        signal = self._last_signal
+        if signal is None:
+            self.logger.info(
+                "[CANDLE15] %s | Regime indisponível | ADX15=%.2f ADX60=%.2f ATR15=%.2f ATR60=%.2f",
+                snapshot["last_candle_time_15m"].strftime("%Y-%m-%d %H:%M"),
+                snapshot["adx15"],
+                snapshot["adx60"],
+                snapshot["atr15"],
+                snapshot["atr60"],
+            )
+            return
+
+        resumo = f"Macro {signal.macro}, contexto {signal.context15}"
+        self.logger.info(
+            "[CANDLE15] %s | macro=%s | contexto15=%s | regime=%s | direction=%s | "
+            "ADX15=%.2f ADX60=%.2f ATR15=%.2f ATR60=%.2f EMA20=%.2f EMA50=%.2f | %s",
+            snapshot["last_candle_time_15m"].strftime("%Y-%m-%d %H:%M"),
+            signal.macro,
+            signal.context15,
+            signal.regime,
+            signal.direction,
+            snapshot["adx15"],
+            snapshot["adx60"],
+            snapshot["atr15"],
+            snapshot["atr60"],
+            snapshot["ema20"],
+            snapshot["ema50"],
+            resumo,
+        )
+
+    def _log_5m_heartbeat(self) -> None:
+        now = now_b3()
+        marker = (now.hour, now.minute)
+        if now.minute % 5 != 0 or self._last_5m_log_marker == marker:
+            return
+        self._last_5m_log_marker = marker
+
+        regime = self.state.current_regime
+        last_15 = self._last_processed_candle.strftime("%H:%M") if self._last_processed_candle is not None else "N/A"
+        mt5_status = "OK" if self.connector.status.connected else "OFF"
+        thread_status = "ATIVA" if self.state.running else "INATIVA"
+        self.logger.info(
+            "[INFO] %s | Regime atual: %s | Último 15m: %s | Thread: %s | MT5: %s",
+            now.strftime("%H:%M"),
+            regime,
+            last_15,
+            thread_status,
+            mt5_status,
+        )
 
     def can_trade(self) -> tuple[bool, str]:
         now = now_b3()
@@ -132,6 +200,11 @@ class TradingEngine:
             self._debug("Posição ativa em simulação; nova entrada bloqueada")
             return
 
+        signal = self.regime_detector.classify(snapshot)
+        self._last_signal = signal
+        self.state.current_regime = signal.regime
+        self.state.blocked_reason = ""
+
         blocked, reason = self.can_trade()
         if blocked:
             self.state.blocked_reason = reason
@@ -144,10 +217,6 @@ class TradingEngine:
             self.state.blocked_reason = "Volatilidade extrema"
             self._debug("Bloqueado por volatilidade extrema")
             return
-
-        signal = self.regime_detector.classify(snapshot)
-        self.state.current_regime = signal.regime
-        self.state.blocked_reason = ""
 
         if signal.regime not in {"TENDENCIA_FORTE", "TENDENCIA_FRACA"}:
             return
@@ -222,23 +291,16 @@ class TradingEngine:
 
         while not self._stop_event.is_set():
             try:
-                now = now_b3()
-                inside_window = is_within_trading_window(now, self.window)
-                self._debug(f"Loop tick: {now.strftime('%H:%M:%S')}")
-                self._debug(f"Dentro do horário: {inside_window}")
-                self._debug(f"Estado da thread ativa: {self.state.running}")
-                self._debug(f"Último candle 15m processado: {self._last_processed_candle}")
-
                 connected = self.connector.ensure_connection()
-                self._debug(f"Resultado conexão MT5: {connected}")
                 if not connected:
                     status_callback("DESCONECTADO")
+                    self._log_5m_heartbeat()
                     time.sleep(2)
                     continue
 
+                self._log_5m_heartbeat()
+
                 blocked, reason = self.can_trade()
-                if blocked:
-                    self._debug(f"Bloqueio detectado: {reason}")
                 if blocked and reason == "Fora do horário operacional (10:00–17:00).":
                     self.logger.info(reason)
                     self._debug("Fora do horário operacional")
@@ -260,26 +322,10 @@ class TradingEngine:
                 self._debug(f"Novo candle 15m detectado: {candle_time.strftime('%H:%M')}")
 
                 self.process_market_snapshot(snapshot, contracts)
+                self._log_15m_event(snapshot)
                 status_callback(f"Regime: {self.state.current_regime}")
                 if regime_callback:
                     regime_callback(self.state.current_regime)
-
-                result_reais = points_to_reais(self.risk.result_points)
-                self._debug(f"Regime: {self.state.current_regime}")
-                self._debug(
-                    f"ADX15: {snapshot['adx15']:.2f} | ATR15: {snapshot['atr15']:.2f} | "
-                    f"EMA20: {snapshot['ema20']:.2f} | EMA50: {snapshot['ema50']:.2f}"
-                )
-                self._debug(
-                    f"Resultado parcial do dia: {self.risk.result_points:.2f} pts | R$ {result_reais:.2f}"
-                )
-
-                self.logger.info(
-                    "Regime atual: %s | ADX: %.2f | ATR15: %.2f",
-                    self.state.current_regime,
-                    snapshot["adx15"],
-                    snapshot["atr15"],
-                )
 
                 time.sleep(1)
             except Exception as exc:
@@ -310,6 +356,7 @@ class TradingEngine:
             name="win-engine-loop",
         )
         self._thread.start()
+        self._log_startup(contracts)
 
     def update_daily_result(self, result_points: float) -> None:
         self.risk.register_trade_result(result_points)
