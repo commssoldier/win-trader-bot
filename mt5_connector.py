@@ -269,6 +269,9 @@ class MT5Connector:
         latest = df15.iloc[-1]
         previous = df15.iloc[-2]
         rng20 = (df15["high"].tail(20).max() - df15["low"].tail(20).min()) if len(df15) >= 20 else 0.0
+        max_high_5 = float(df15["high"].tail(5).max())
+        min_low_5 = float(df15["low"].tail(5).min())
+        vol_avg20 = float(df15["tick_volume"].tail(20).mean()) if len(df15) >= 20 else float(df15["tick_volume"].mean())
 
         return {
             "last_candle_time_15m": latest["time"],
@@ -276,6 +279,13 @@ class MT5Connector:
             "adx15": float(latest["adx14"]),
             "ema20": float(latest["ema20"]),
             "ema50": float(latest["ema50"]),
+            "close_15m": float(latest["close"]),
+            "high_15m": float(latest["high"]),
+            "low_15m": float(latest["low"]),
+            "volume_15m": float(latest["tick_volume"]),
+            "volume_avg20": vol_avg20,
+            "breakout_high_5": max_high_5,
+            "breakout_low_5": min_low_5,
             "atr_series": df15["atr14"].tail(80).astype("float64").tolist(),
             "range20": float(rng20),
             "breakout": bool(latest["close"] > previous["high"] or latest["close"] < previous["low"]),

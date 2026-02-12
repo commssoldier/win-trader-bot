@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Callable, Optional
 
 from equity_tracker import EquityTracker
@@ -23,6 +23,17 @@ class EngineState:
     running: bool = False
     blocked_reason: str = ""
     current_regime: str = "NEUTRO"
+
+
+@dataclass
+class SimulatedPosition:
+    side: str
+    entry_price: float
+    stop_price: float
+    take_price: float
+    stop_points: float
+    take_points: float
+    opened_at: datetime
 
 
 class TradingEngine:
@@ -58,10 +69,19 @@ class TradingEngine:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
+        self.active_position: SimulatedPosition | None = None
+        self.simulated_trades_opened = 0
+
     def _debug(self, message: str) -> None:
         if not self.debug_mode:
             return
         payload = f"[DEBUG] {message}"
+        self.logger.info(payload)
+        if self._debug_callback:
+            self._debug_callback(payload)
+
+    def _signal(self, message: str) -> None:
+        payload = f"[SINAL] {message}"
         self.logger.info(payload)
         if self._debug_callback:
             self._debug_callback(payload)
@@ -73,39 +93,127 @@ class TradingEngine:
         if not is_within_trading_window(now, self.window):
             return True, "Fora do horário operacional (10:00–17:00)."
         blocked, reason = self.risk.should_block()
+        if not blocked and self.simulated_trades_opened >= self.profile.max_trades_per_day:
+            return True, "Máximo de trades do dia"
         return blocked, reason
 
-    def process_market_snapshot(self, data: dict, contracts: int) -> None:
+    def _evaluate_open_position(self, snapshot: dict) -> None:
+        """Atualiza posição simulada ativa com base no candle atual."""
+        if not self.active_position:
+            return
+
+        pos = self.active_position
+        hit_stop = False
+        hit_take = False
+
+        if pos.side == "BUY":
+            hit_stop = snapshot["low_15m"] <= pos.stop_price
+            hit_take = snapshot["high_15m"] >= pos.take_price
+        else:
+            hit_stop = snapshot["high_15m"] >= pos.stop_price
+            hit_take = snapshot["low_15m"] <= pos.take_price
+
+        if not hit_stop and not hit_take:
+            return
+
+        if hit_stop:
+            result_points = -pos.stop_points
+            self._signal("Stop atingido")
+        else:
+            result_points = pos.take_points
+            self._signal("Alvo atingido")
+
+        self.update_daily_result(result_points)
+        self.active_position = None
+
+    def _maybe_open_simulated_position(self, snapshot: dict) -> None:
+        """Abre posição simulada se todas regras de entrada forem satisfeitas."""
+        if self.active_position is not None:
+            self._debug("Posição ativa em simulação; nova entrada bloqueada")
+            return
+
         blocked, reason = self.can_trade()
         if blocked:
             self.state.blocked_reason = reason
             self._debug(f"Bloqueado por: {reason}")
             return
 
-        current_atr = data["atr15"]
-        if self.vol_filter.is_extreme(data["atr_series"], current_atr):
+        current_atr = snapshot["atr15"]
+        if self.vol_filter.is_extreme(snapshot["atr_series"], current_atr):
             self.state.current_regime = "PAUSADO"
             self.state.blocked_reason = "Volatilidade extrema"
             self._debug("Bloqueado por volatilidade extrema")
             return
 
         signal = self.regime_detector.classify(
-            adx15=data["adx15"],
-            ema20=data["ema20"],
-            ema50=data["ema50"],
+            adx15=snapshot["adx15"],
+            ema20=snapshot["ema20"],
+            ema50=snapshot["ema50"],
             limit_trend=self.profile.adx_min,
             limit_range=18.0,
-            range20=data["range20"],
+            range20=snapshot["range20"],
             vol_extreme=False,
         )
         self.state.current_regime = signal.regime
         self.state.blocked_reason = ""
 
-        if signal.regime == "TENDENCIA":
-            stop_pts, take_pts = self.risk.compute_stop_take_points(current_atr)
-            side = "BUY" if signal.direction == "COMPRA" else "SELL"
-            mode = "market" if data.get("breakout", True) else "limit"
-            self.execution.send_order(side, contracts, stop_pts, take_pts, mode)
+        if signal.regime != "TENDENCIA":
+            return
+
+        close_price = snapshot["close_15m"]
+        adx_ok = snapshot["adx15"] > self.profile.adx_min
+        volume_ok = snapshot["volume_15m"] > snapshot["volume_avg20"]
+
+        buy_signal = (
+            snapshot["ema20"] > snapshot["ema50"]
+            and adx_ok
+            and close_price > snapshot["breakout_high_5"]
+            and volume_ok
+        )
+        sell_signal = (
+            snapshot["ema20"] < snapshot["ema50"]
+            and adx_ok
+            and close_price < snapshot["breakout_low_5"]
+            and volume_ok
+        )
+
+        if not buy_signal and not sell_signal:
+            return
+
+        side = "BUY" if buy_signal else "SELL"
+        stop_points = self.profile.atr_multiplier * snapshot["atr15"]
+        take_points = 2.0 * stop_points
+
+        if side == "BUY":
+            stop_price = close_price - stop_points
+            take_price = close_price + take_points
+        else:
+            stop_price = close_price + stop_points
+            take_price = close_price - take_points
+
+        self.active_position = SimulatedPosition(
+            side=side,
+            entry_price=close_price,
+            stop_price=stop_price,
+            take_price=take_price,
+            stop_points=stop_points,
+            take_points=take_points,
+            opened_at=snapshot["last_candle_time_15m"],
+        )
+        self.simulated_trades_opened += 1
+
+        self._signal(
+            f"{'COMPRA' if side == 'BUY' else 'VENDA'} | Entrada: {close_price:.2f} | "
+            f"Stop: {stop_price:.2f} | Take: {take_price:.2f} | Risco pts: {stop_points:.2f}"
+        )
+
+    def process_market_snapshot(self, data: dict, contracts: int) -> None:
+        """Processa snapshot em modo simulação de sinais (sem ordem real)."""
+        _ = contracts
+        if getattr(self.profile, "simulation_mode", True):
+            self._evaluate_open_position(data)
+            self._maybe_open_simulated_position(data)
+            return
 
     def run_loop(
         self,

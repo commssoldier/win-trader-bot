@@ -16,6 +16,7 @@ class StrategyProfile:
     risk_per_trade_pct: float
     reward_multiplier: float = 2.0
     consecutive_losses_limit: int = 3
+    simulation_mode: bool = True
 
 
 DEFAULT_PROFILES: Dict[str, StrategyProfile] = {
