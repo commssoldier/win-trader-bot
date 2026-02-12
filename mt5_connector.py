@@ -1,4 +1,4 @@
-"""Conector de sessão com MetaTrader5 e coleta de dados."""
+"""Conector de sessão com MetaTrader5."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,7 +6,6 @@ from datetime import datetime
 from typing import Optional
 
 import MetaTrader5 as mt5
-import pandas as pd
 
 
 @dataclass
@@ -74,78 +73,3 @@ class MT5Connector:
             self.logger.warning("Conexão MT5 perdida")
             self._status.connected = False
         return connected
-
-    def get_rates_dataframe(self, symbol: str, timeframe: int, bars: int = 300) -> Optional[pd.DataFrame]:
-        """Busca candles e retorna DataFrame com índice temporal."""
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
-        if rates is None or len(rates) < 60:
-            self.logger.warning("Sem candles suficientes para %s/%s", symbol, timeframe)
-            return None
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        return df
-
-    @staticmethod
-    def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        high = df["high"]
-        low = df["low"]
-        close = df["close"]
-
-        up_move = high.diff()
-        down_move = -low.diff()
-
-        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-        atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-        plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, pd.NA))
-        minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, pd.NA))
-        dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
-        return dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0)
-
-    @staticmethod
-    def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        high = df["high"]
-        low = df["low"]
-        close = df["close"]
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.ewm(alpha=1 / period, adjust=False).mean().fillna(0)
-
-    def build_market_snapshot(self, symbol: str) -> Optional[dict]:
-        """Monta snapshot com candles 5m/15m/60m e indicadores."""
-        df5 = self.get_rates_dataframe(symbol, mt5.TIMEFRAME_M5)
-        df15 = self.get_rates_dataframe(symbol, mt5.TIMEFRAME_M15)
-        df60 = self.get_rates_dataframe(symbol, mt5.TIMEFRAME_H1)
-        if df5 is None or df15 is None or df60 is None:
-            return None
-
-        df15 = df15.copy()
-        df15["ema20"] = df15["close"].ewm(span=20, adjust=False).mean()
-        df15["ema50"] = df15["close"].ewm(span=50, adjust=False).mean()
-        df15["atr14"] = self._atr(df15, 14)
-        df15["adx14"] = self._adx(df15, 14)
-
-        latest = df15.iloc[-1]
-        previous = df15.iloc[-2]
-        rng20 = (df15["high"].tail(20).max() - df15["low"].tail(20).min()) if len(df15) >= 20 else 0.0
-
-        return {
-            "last_candle_time_15m": latest["time"],
-            "atr15": float(latest["atr14"]),
-            "adx15": float(latest["adx14"]),
-            "ema20": float(latest["ema20"]),
-            "ema50": float(latest["ema50"]),
-            "atr_series": df15["atr14"].tail(80).astype(float).tolist(),
-            "range20": float(rng20),
-            "breakout": bool(latest["close"] > previous["high"] or latest["close"] < previous["low"]),
-            "pullback": bool(df5["close"].iloc[-1] < df5["high"].tail(5).max()),
-            "macro_context": "ALTA" if df60["close"].iloc[-1] > df60["close"].ewm(span=20, adjust=False).mean().iloc[-1] else "BAIXA",
-        }

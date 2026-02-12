@@ -54,7 +54,5 @@ def points_to_reais(points: float) -> float:
 
 
 def max_contracts(capital: float) -> int:
-    """Calcula quantidade máxima de contratos por capital usando floor(capital/2000)."""
-    if capital <= 0:
-        return 0
-    return floor(capital / 2000.0)
+    """Calcula quantidade máxima de contratos por capital."""
+    return max(1, floor(capital / 2000.0))
