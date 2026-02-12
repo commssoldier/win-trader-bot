@@ -153,28 +153,42 @@ class MT5Connector:
             return None
         return df
 
-    @staticmethod
-    def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        high = df["high"]
-        low = df["low"]
-        close = df["close"]
+    def _adx(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calcula ADX usando apenas pandas.Series explícitas."""
+        high: pd.Series = df["high"].astype(float)
+        low: pd.Series = df["low"].astype(float)
+        close: pd.Series = df["close"].astype(float)
 
-        up_move = high.diff()
-        down_move = -low.diff()
+        up_move: pd.Series = high.diff()
+        down_move: pd.Series = -low.diff()
 
-        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+        plus_dm: pd.Series = up_move.where((up_move > down_move) & (up_move > 0), 0.0).astype(float)
+        minus_dm: pd.Series = down_move.where((down_move > up_move) & (down_move > 0), 0.0).astype(float)
 
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        tr1: pd.Series = (high - low).astype(float)
+        tr2: pd.Series = (high - close.shift()).abs().astype(float)
+        tr3: pd.Series = (low - close.shift()).abs().astype(float)
+        tr: pd.Series = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).astype(float)
 
-        atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-        plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, pd.NA))
-        minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, pd.NA))
-        dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
-        return dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0)
+        self._debug(f"type(tr)={type(tr)}")
+        self._debug(f"type(plus_dm)={type(plus_dm)}")
+
+        atr: pd.Series = tr.ewm(alpha=1 / period, adjust=False).mean().astype(float)
+        plus_di: pd.Series = (
+            100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, pd.NA))
+        ).astype(float)
+        minus_di: pd.Series = (
+            100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, pd.NA))
+        ).astype(float)
+
+        dx: pd.Series = (
+            ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
+        ).astype(float)
+        self._debug(f"type(dx)={type(dx)}")
+
+        adx: pd.Series = dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0).astype(float)
+        return adx
+
 
     @staticmethod
     def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -223,6 +237,7 @@ class MT5Connector:
             if df15["close"].isna().all():
                 self._debug("Abortado ADX: close ficou 100% NaN")
                 return None
+            self._debug(f"Series close para ADX: {type(df15['close'])}")
             df15["adx14"] = self._adx(df15, 14)
         except Exception as exc:
             self._debug(f"Erro ao calcular ADX: {exc}")
