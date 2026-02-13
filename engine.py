@@ -1,10 +1,14 @@
 """Motor principal orientado a eventos de candle para o Sniper Adaptativo."""
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Optional
+
+import pandas as pd
 
 from equity_tracker import EquityTracker
 from execution_manager import ExecutionManager
@@ -30,6 +34,14 @@ class SimulatedPosition:
     take_price: float
     stop_points: float
     take_points: float
+    opened_at: datetime
+    regime: str
+    confidence: float
+    atr15: float
+    adx15: float
+    dist_rel: float
+    slope_rel: float
+    rr_ratio: float
     breakeven_armed: bool = False
 
 
@@ -192,6 +204,9 @@ class TradingEngine:
             stop_points = stop_price - entry_price
             take_price = entry_price - take_points
 
+        rr_ratio = (take_points / stop_points) if stop_points > 0 else 0.0
+        slope_rel = (snapshot["ema20_15"] - snapshot["ema20_15_prev3"]) / snapshot["atr15"] if snapshot["atr15"] > 0 else 0.0
+
         self.active_position = SimulatedPosition(
             side=side,
             contracts=contracts,
@@ -200,17 +215,71 @@ class TradingEngine:
             take_price=take_price,
             stop_points=stop_points,
             take_points=take_points,
+            opened_at=now_b3(),
+            regime=signal.regime,
+            confidence=signal.confidence_score,
+            atr15=snapshot["atr15"],
+            adx15=snapshot["adx15"],
+            dist_rel=signal.dist_rel_15,
+            slope_rel=slope_rel,
+            rr_ratio=rr_ratio,
         )
         self._signal(
             f"ABERTURA {('COMPRA' if side == 'BUY' else 'VENDA')} | Entrada={entry_price:.2f} | "
             f"SL={stop_price:.2f} | TP={take_price:.2f} | R={stop_points:.2f}"
         )
 
-    def _close_position(self, result_points: float, reason: str) -> None:
+    def _persist_closed_trade(self, pos: SimulatedPosition, exit_price: float, reason: str, pnl_points: float) -> None:
+        now = datetime.now()
+        year = now.year
+        month = now.month
+        folder = f"reports/{year}"
+        filename = f"{folder}/trades_{year}_{month:02d}.csv"
+
+        duration_minutes = (now_b3() - pos.opened_at).total_seconds() / 60.0
+        row = {
+            "timestamp_open": pos.opened_at.isoformat(),
+            "timestamp_close": now_b3().isoformat(),
+            "direction": "COMPRA" if pos.side == "BUY" else "VENDA",
+            "entry_price": pos.entry_price,
+            "stop_loss": pos.stop_price,
+            "take_profit": pos.take_price,
+            "exit_price": exit_price,
+            "exit_reason": reason,
+            "pnl_points": pnl_points,
+            "pnl_reais": points_to_reais(pnl_points),
+            "regime": pos.regime,
+            "confidence": pos.confidence,
+            "atr15": pos.atr15,
+            "adx15": pos.adx15,
+            "dist_rel": pos.dist_rel,
+            "slope_rel": pos.slope_rel,
+            "rr_ratio": pos.rr_ratio,
+            "duration_minutes": round(duration_minutes, 2),
+        }
+
+        try:
+            os.makedirs(folder, exist_ok=True)
+            df = pd.DataFrame([row])
+            df.to_csv(
+                filename,
+                mode="a",
+                header=not os.path.exists(filename),
+                index=False,
+            )
+            self.logger.info("[REPORT] Trade salvo em %s", filename)
+        except Exception as exc:
+            self.logger.exception("[REPORT] Erro ao salvar trade em CSV mensal: %s", exc)
+
+    def _close_position(self, result_points: float, reason: str, exit_price: float) -> None:
+        if not self.active_position:
+            return
+        pos = self.active_position
         self.risk.register_trade_result(result_points)
         self._trade_count += 1
         total_reais = points_to_reais(self.risk.result_points)
         self.equity.add(total_reais, self._trade_count, total_reais)
+        self._persist_closed_trade(pos, exit_price=exit_price, reason=reason, pnl_points=result_points)
         self._signal(f"FECHAMENTO {reason} | Resultado={result_points:.2f} pts | Acumulado={self.risk.result_points:.2f} pts")
         self.active_position = None
 
@@ -223,10 +292,11 @@ class TradingEngine:
 
         if pos.side == "BUY":
             if price <= pos.stop_price:
-                self._close_position(-pos.stop_points, "STOP")
+                reason = "TRAILING" if pos.breakeven_armed else "SL"
+                self._close_position(-pos.stop_points, reason, exit_price=price)
                 return
             if price >= pos.take_price:
-                self._close_position(pos.take_points, "TAKE")
+                self._close_position(pos.take_points, "TP", exit_price=price)
                 return
             if not pos.breakeven_armed and price - pos.entry_price >= pos.stop_points:
                 pos.stop_price = pos.entry_price
@@ -235,10 +305,11 @@ class TradingEngine:
                 pos.stop_price = max(pos.stop_price, snapshot["ema20_5"])
         else:
             if price >= pos.stop_price:
-                self._close_position(-pos.stop_points, "STOP")
+                reason = "TRAILING" if pos.breakeven_armed else "SL"
+                self._close_position(-pos.stop_points, reason, exit_price=price)
                 return
             if price <= pos.take_price:
-                self._close_position(pos.take_points, "TAKE")
+                self._close_position(pos.take_points, "TP", exit_price=price)
                 return
             if not pos.breakeven_armed and pos.entry_price - price >= pos.stop_points:
                 pos.stop_price = pos.entry_price
