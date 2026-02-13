@@ -229,17 +229,16 @@ class TradingEngine:
             f"SL={stop_price:.2f} | TP={take_price:.2f} | R={stop_points:.2f}"
         )
 
-    def _persist_closed_trade(self, pos: SimulatedPosition, exit_price: float, reason: str, pnl_points: float) -> None:
-        now = datetime.now()
-        year = now.year
-        month = now.month
+    def _persist_closed_trade(self, pos: SimulatedPosition, exit_price: float, reason: str, pnl_points: float, close_time) -> None:
+        year = close_time.year
+        month = close_time.month
         folder = f"reports/{year}"
         filename = f"{folder}/trades_{year}_{month:02d}.csv"
 
-        duration_minutes = (now_b3() - pos.opened_at).total_seconds() / 60.0
+        duration_minutes = (close_time - pos.opened_at).total_seconds() / 60.0
         row = {
             "timestamp_open": pos.opened_at.isoformat(),
-            "timestamp_close": now_b3().isoformat(),
+            "timestamp_close": close_time.isoformat(),
             "direction": "COMPRA" if pos.side == "BUY" else "VENDA",
             "entry_price": pos.entry_price,
             "stop_loss": pos.stop_price,
@@ -271,15 +270,20 @@ class TradingEngine:
         except Exception as exc:
             self.logger.exception("[REPORT] Erro ao salvar trade em CSV mensal: %s", exc)
 
-    def _close_position(self, result_points: float, reason: str, exit_price: float) -> None:
+    def _close_position(self, reason: str, exit_price: float) -> None:
         if not self.active_position:
             return
         pos = self.active_position
+        if pos.side == "BUY":
+            result_points = exit_price - pos.entry_price
+        else:
+            result_points = pos.entry_price - exit_price
+        close_time = now_b3()
         self.risk.register_trade_result(result_points)
         self._trade_count += 1
         total_reais = points_to_reais(self.risk.result_points)
         self.equity.add(total_reais, self._trade_count, total_reais)
-        self._persist_closed_trade(pos, exit_price=exit_price, reason=reason, pnl_points=result_points)
+        self._persist_closed_trade(pos, exit_price=exit_price, reason=reason, pnl_points=result_points, close_time=close_time)
         self._signal(f"FECHAMENTO {reason} | Resultado={result_points:.2f} pts | Acumulado={self.risk.result_points:.2f} pts")
         self.active_position = None
 
@@ -293,29 +297,31 @@ class TradingEngine:
         if pos.side == "BUY":
             if price <= pos.stop_price:
                 reason = "TRAILING" if pos.breakeven_armed else "SL"
-                self._close_position(-pos.stop_points, reason, exit_price=price)
+                self._close_position(reason, exit_price=price)
                 return
             if price >= pos.take_price:
-                self._close_position(pos.take_points, "TP", exit_price=price)
+                self._close_position("TP", exit_price=price)
                 return
             if not pos.breakeven_armed and price - pos.entry_price >= pos.stop_points:
                 pos.stop_price = pos.entry_price
                 pos.breakeven_armed = True
             if pos.breakeven_armed:
                 pos.stop_price = max(pos.stop_price, snapshot["ema20_5"])
+                pos.stop_price = min(pos.stop_price, pos.take_price - 1.0)
         else:
             if price >= pos.stop_price:
                 reason = "TRAILING" if pos.breakeven_armed else "SL"
-                self._close_position(-pos.stop_points, reason, exit_price=price)
+                self._close_position(reason, exit_price=price)
                 return
             if price <= pos.take_price:
-                self._close_position(pos.take_points, "TP", exit_price=price)
+                self._close_position("TP", exit_price=price)
                 return
             if not pos.breakeven_armed and pos.entry_price - price >= pos.stop_points:
                 pos.stop_price = pos.entry_price
                 pos.breakeven_armed = True
             if pos.breakeven_armed:
                 pos.stop_price = min(pos.stop_price, snapshot["ema20_5"])
+                pos.stop_price = max(pos.stop_price, pos.take_price + 1.0)
 
     def _maybe_open_position(self, max_contracts_allowed: int) -> None:
         if self.active_position is not None or not self._latest_snapshot or not self._latest_signal:
