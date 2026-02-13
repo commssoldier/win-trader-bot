@@ -4,9 +4,9 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Callable, Optional
 
+from equity_tracker import EquityTracker
 from execution_manager import ExecutionManager
 from mt5_connector import MT5Connector
 from regime_detector import RegimeDetector, RegimeSignal
@@ -30,7 +30,7 @@ class SimulatedPosition:
     take_price: float
     stop_points: float
     take_points: float
-    trailing_active: bool = False
+    breakeven_armed: bool = False
 
 
 class TradingEngine:
@@ -53,6 +53,7 @@ class TradingEngine:
 
         self.window = TradingWindow()
         self.risk = RiskManager(capital)
+        self.equity = EquityTracker()
         self.regime_detector = RegimeDetector(debug_mode=debug_mode, debug_callback=debug_callback)
         self.state = EngineState()
 
@@ -60,10 +61,10 @@ class TradingEngine:
         self._stop_event = threading.Event()
         self._last_15m_time = None
         self._last_5m_time = None
-        self._last_heartbeat_marker: tuple[int, int, int] | None = None
         self._latest_snapshot: dict | None = None
         self._latest_signal: RegimeSignal | None = None
         self._current_direction = "NEUTRO"
+        self._trade_count = 0
 
         self.active_position: SimulatedPosition | None = None
 
@@ -76,7 +77,7 @@ class TradingEngine:
             self._debug_callback(payload)
 
     def _signal(self, message: str) -> None:
-        payload = f"[SINAL] {message}"
+        payload = f"[TRADE] {message}"
         self.logger.info(payload)
         if self._debug_callback:
             self._debug_callback(payload)
@@ -101,8 +102,8 @@ class TradingEngine:
             blocks.append("vencimento")
         if not is_within_trading_window(now, self.window):
             blocks.append("fora_horario")
-        if self.state.current_regime == "LATERAL":
-            blocks.append("lateral")
+        if self._latest_signal and self._latest_signal.regime != "TENDENCIA_FORTE":
+            blocks.append("regime_nao_qualificado")
         return ",".join(blocks) if blocks else "nenhum"
 
     def _log_15m_event(self, tag: str) -> None:
@@ -128,61 +129,6 @@ class TradingEngine:
             points_to_reais(self.risk.result_points),
         )
 
-    def _log_15m_heartbeat(self) -> None:
-        now = now_b3()
-        marker = (now.year, now.timetuple().tm_yday, now.hour * 60 + now.minute)
-        if now.minute % 15 != 0 or self._last_heartbeat_marker == marker:
-            return
-        self._last_heartbeat_marker = marker
-
-        regime = self.state.current_regime
-        direction = self._current_direction
-        self.logger.info(
-            "[INFO] %s | Regime: %s | Direção: %s | Bloqueios: %s | Resultado: %.2f pts / R$ %.2f",
-            now.strftime("%H:%M"),
-            regime,
-            direction,
-            self._active_blocks(),
-            self.risk.result_points,
-            points_to_reais(self.risk.result_points),
-        )
-
-    def _evaluate_open_position(self, price: float, atr15: float) -> None:
-        if not self.active_position:
-            return
-
-        pos = self.active_position
-        if pos.side == "BUY":
-            if price <= pos.stop_price:
-                self.risk.register_trade_result(-pos.stop_points)
-                self._signal("Stop atingido")
-                self.active_position = None
-                return
-            if price >= pos.take_price:
-                self.risk.register_trade_result(pos.take_points)
-                self._signal("Alvo atingido")
-                self.active_position = None
-                return
-            if not pos.trailing_active and price - pos.entry_price >= pos.stop_points:
-                pos.trailing_active = True
-            if pos.trailing_active:
-                pos.stop_price = max(pos.stop_price, price - atr15)
-        else:
-            if price >= pos.stop_price:
-                self.risk.register_trade_result(-pos.stop_points)
-                self._signal("Stop atingido")
-                self.active_position = None
-                return
-            if price <= pos.take_price:
-                self.risk.register_trade_result(pos.take_points)
-                self._signal("Alvo atingido")
-                self.active_position = None
-                return
-            if not pos.trailing_active and pos.entry_price - price >= pos.stop_points:
-                pos.trailing_active = True
-            if pos.trailing_active:
-                pos.stop_price = min(pos.stop_price, price + atr15)
-
     def _can_trade_now(self) -> bool:
         now = now_b3()
         if is_expiration_day(now.date()):
@@ -191,73 +137,48 @@ class TradingEngine:
         if not is_within_trading_window(now, self.window):
             self.state.blocked_reason = "Fora do horário operacional (10:00–17:00)."
             return False
-        if self.state.current_regime == "LATERAL":
-            self.state.blocked_reason = "Regime lateral"
-            return False
         self.state.blocked_reason = ""
         return True
 
     def _entry_conditions_met(self, snapshot: dict, signal: RegimeSignal) -> tuple[bool, str]:
-        direction = signal.direction
-        if direction == "NEUTRO":
-            return False, "direcao_neutra"
+        if signal.macro != "MACRO_TENDENCIA":
+            return False, "macro"
+        if signal.context15 != "TENDENCIA_FORTE":
+            return False, "context15"
+        if signal.confidence_score < 0.75:
+            return False, "confidence"
 
-        pullback_ok = snapshot["pullback_to_ema"]
-        breakout_buy = snapshot["close_15m"] > snapshot["breakout_high_5"]
-        breakout_sell = snapshot["close_15m"] < snapshot["breakout_low_5"]
-        breakout_ok = breakout_buy if direction == "COMPRA" else breakout_sell
+        close_15 = snapshot["close_15m"]
+        high_15 = snapshot["high_15m"]
+        low_15 = snapshot["low_15m"]
+        ema20 = snapshot["ema20_15"]
+        ema50 = snapshot["ema50_15"]
 
-        if signal.regime == "TENDENCIA_FORTE":
-            if pullback_ok or breakout_ok:
-                return True, "pullback_ou_breakout"
-            return False, "sem_gatilho_tendencia_forte"
-
-        if signal.regime == "TENDENCIA_FRACA":
-            return (pullback_ok, "pullback" if pullback_ok else "sem_pullback")
-
-        if signal.regime == "TRANSICAO":
-            conditions = [
-                pullback_ok,
-                snapshot["rejection_5m"],
-                snapshot["adx15"] > 22,
-                snapshot["macro_aligned"],
-                snapshot["ema_distance_atr"] > 0.5,
-            ]
-            return all(conditions), "filtro_transicao"
-
-        return False, "regime_sem_trade"
-
-    def _maybe_open_position(self, max_contracts_allowed: int) -> None:
-        if self.active_position is not None or not self._latest_snapshot or not self._latest_signal:
-            return
-        if not self._can_trade_now():
-            return
-
-        signal = self._latest_signal
-        cfg = self.risk.regime_config(signal.regime)
-        if cfg.risk_percent <= 0:
-            return
-
-        levels = self.risk.build_trade_levels(self._latest_snapshot["atr15"])
-        size = self.risk.calculate_position_size(self.risk.capital, cfg.risk_percent, levels.stop_points)
-        contracts = min(size.contracts, max_contracts_allowed)
-        if contracts <= 0:
-            return
-
-        entry_ok, reason = self._entry_conditions_met(self._latest_snapshot, signal)
-        if not entry_ok:
-            self._debug(f"Entrada rejeitada: {reason}")
-            return
-
-        entry_price = self._latest_snapshot["close_5m"]
         if signal.direction == "COMPRA":
-            stop_price = entry_price - levels.stop_points
-            take_price = entry_price + levels.take_points
-            side = "BUY"
+            pullback_ok = ema20 > ema50 and low_15 <= ema20 and close_15 > ema20
+        elif signal.direction == "VENDA":
+            pullback_ok = ema20 < ema50 and high_15 >= ema20 and close_15 < ema20
         else:
-            stop_price = entry_price + levels.stop_points
-            take_price = entry_price - levels.take_points
+            pullback_ok = False
+
+        return pullback_ok, "pullback"
+
+    def _open_position(self, contracts: int, snapshot: dict, signal: RegimeSignal) -> None:
+        stop_points_base = 1.2 * snapshot["atr15"]
+        dist_mult = 2.5 if snapshot["ema_distance_atr"] > 1.5 else 2.0
+        take_points = dist_mult * stop_points_base
+        entry_price = snapshot["close_5m"]
+
+        if signal.direction == "COMPRA":
+            stop_price = min(entry_price - stop_points_base, snapshot["low_15m"] - 1.0)
+            side = "BUY"
+            stop_points = entry_price - stop_price
+            take_price = entry_price + take_points
+        else:
+            stop_price = max(entry_price + stop_points_base, snapshot["high_15m"] + 1.0)
             side = "SELL"
+            stop_points = stop_price - entry_price
+            take_price = entry_price - take_points
 
         self.active_position = SimulatedPosition(
             side=side,
@@ -265,19 +186,76 @@ class TradingEngine:
             entry_price=entry_price,
             stop_price=stop_price,
             take_price=take_price,
-            stop_points=levels.stop_points,
-            take_points=levels.take_points,
+            stop_points=stop_points,
+            take_points=take_points,
         )
         self._signal(
-            f"{'COMPRA' if side == 'BUY' else 'VENDA'} | Entrada: {entry_price:.2f} | Stop: {stop_price:.2f} | "
-            f"Take: {take_price:.2f} | Risco pts: {levels.stop_points:.2f} | Contratos: {contracts}"
+            f"ABERTURA {('COMPRA' if side == 'BUY' else 'VENDA')} | Entrada={entry_price:.2f} | "
+            f"SL={stop_price:.2f} | TP={take_price:.2f} | R={stop_points:.2f}"
         )
+
+    def _close_position(self, result_points: float, reason: str) -> None:
+        self.risk.register_trade_result(result_points)
+        self._trade_count += 1
+        total_reais = points_to_reais(self.risk.result_points)
+        self.equity.add(total_reais, self._trade_count, total_reais)
+        self._signal(f"FECHAMENTO {reason} | Resultado={result_points:.2f} pts | Acumulado={self.risk.result_points:.2f} pts")
+        self.active_position = None
+
+    def _manage_open_position(self, snapshot: dict) -> None:
+        if not self.active_position:
+            return
+
+        pos = self.active_position
+        price = snapshot["close_5m"]
+
+        if pos.side == "BUY":
+            if price <= pos.stop_price:
+                self._close_position(-pos.stop_points, "STOP")
+                return
+            if price >= pos.take_price:
+                self._close_position(pos.take_points, "TAKE")
+                return
+            if not pos.breakeven_armed and price - pos.entry_price >= pos.stop_points:
+                pos.stop_price = pos.entry_price
+                pos.breakeven_armed = True
+            if pos.breakeven_armed:
+                pos.stop_price = max(pos.stop_price, snapshot["ema20_5"])
+        else:
+            if price >= pos.stop_price:
+                self._close_position(-pos.stop_points, "STOP")
+                return
+            if price <= pos.take_price:
+                self._close_position(pos.take_points, "TAKE")
+                return
+            if not pos.breakeven_armed and pos.entry_price - price >= pos.stop_points:
+                pos.stop_price = pos.entry_price
+                pos.breakeven_armed = True
+            if pos.breakeven_armed:
+                pos.stop_price = min(pos.stop_price, snapshot["ema20_5"])
+
+    def _maybe_open_position(self, max_contracts_allowed: int) -> None:
+        if self.active_position is not None or not self._latest_snapshot or not self._latest_signal:
+            return
+        if not self._can_trade_now():
+            return
+
+        qualified, _ = self._entry_conditions_met(self._latest_snapshot, self._latest_signal)
+        if not qualified:
+            return
+
+        stop_points = 1.2 * self._latest_snapshot["atr15"]
+        size = self.risk.calculate_position_size(self.risk.capital, 0.0075, stop_points)
+        contracts = min(size.contracts, max_contracts_allowed)
+        if contracts <= 0:
+            return
+
+        self._open_position(contracts, self._latest_snapshot, self._latest_signal)
 
     def _process_15m_event(self, contracts: int, tag: str) -> None:
         snapshot = self.connector.build_market_snapshot(self.symbol)
         if not snapshot:
             return
-
         self._latest_snapshot = snapshot
         self._latest_signal = self.regime_detector.classify(snapshot)
         self.state.current_regime = self._latest_signal.regime
@@ -285,6 +263,15 @@ class TradingEngine:
         self._last_15m_time = snapshot["last_candle_time_15m"]
 
         self._log_15m_event(tag)
+        self._maybe_open_position(contracts)
+
+    def _process_5m_event(self, contracts: int) -> None:
+        snapshot = self.connector.build_market_snapshot(self.symbol)
+        if not snapshot:
+            return
+        self._latest_snapshot = snapshot
+        self._last_5m_time = snapshot["last_candle_time_5m"]
+        self._manage_open_position(snapshot)
         self._maybe_open_position(contracts)
 
     def run_loop(self, contracts: int, status_callback: Callable[[str], None], regime_callback: Callable[[str], None] | None = None) -> None:
@@ -303,8 +290,6 @@ class TradingEngine:
                     time.sleep(1)
                     continue
 
-                self._log_15m_heartbeat()
-
                 if not self._can_trade_now() and self.state.blocked_reason.startswith("Fora do horário"):
                     status_callback("AGUARDANDO HORÁRIO")
 
@@ -317,12 +302,7 @@ class TradingEngine:
 
                 last_5m = self.connector.get_last_candle_time_5m(self.symbol)
                 if last_5m is not None and last_5m != self._last_5m_time:
-                    self._last_5m_time = last_5m
-                    if self._latest_snapshot:
-                        self._latest_snapshot["last_candle_time_5m"] = last_5m
-                        price = self._latest_snapshot["close_5m"]
-                        self._evaluate_open_position(price, self._latest_snapshot["atr15"])
-                    self._maybe_open_position(contracts)
+                    self._process_5m_event(contracts)
 
                 time.sleep(1)
             except Exception as exc:

@@ -173,6 +173,7 @@ class MT5Connector:
         df15 = df15.copy()
         df60 = df60.copy()
 
+        df5["ema20"] = df5["close"].ewm(span=20, adjust=False).mean()
         df15["ema20"] = df15["close"].ewm(span=20, adjust=False).mean()
         df15["ema50"] = df15["close"].ewm(span=50, adjust=False).mean()
         df15["atr14"] = self._atr(df15, 14)
@@ -213,6 +214,9 @@ class MT5Connector:
             "low_15m": float(latest15["low"]),
             "ema20": float(latest15["ema20"]),
             "ema50": float(latest15["ema50"]),
+            "ema20_15": float(latest15["ema20"]),
+            "ema50_15": float(latest15["ema50"]),
+            "ema20_5": float(df5["ema20"].iloc[-1]),
             "ema20_15_prev3": float(df15["ema20"].iloc[-4]),
             "atr15": float(latest15["atr14"]),
             "atr15_prev": float(prev15["atr14"]),
