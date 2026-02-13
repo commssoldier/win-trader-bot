@@ -73,6 +73,7 @@ class TradingEngine:
         self.simulated_trades_opened = 0
         self._last_signal = None
         self._last_5m_log_marker: tuple[int, int] | None = None
+        self._current_direction = "NEUTRO"
 
     def _debug(self, message: str) -> None:
         if not self.debug_mode:
@@ -88,7 +89,6 @@ class TradingEngine:
         if self._debug_callback:
             self._debug_callback(payload)
 
-
     def _log_startup(self, contracts: int) -> None:
         status = "OK" if self.connector.status.connected else "DESCONECTADO"
         self.logger.info(
@@ -103,23 +103,33 @@ class TradingEngine:
             "on" if self.debug_mode else "off",
         )
 
-    def _log_15m_event(self, snapshot: dict) -> None:
+    def _log_15m_event(self, snapshot: dict, tag: str = "CANDLE15") -> None:
         signal = self._last_signal
+        blocked, reason = self.can_trade()
+        bloqueio = reason if blocked else "Nenhum"
+        result_reais = points_to_reais(self.risk.result_points)
+
         if signal is None:
             self.logger.info(
-                "[CANDLE15] %s | Regime indisponível | ADX15=%.2f ADX60=%.2f ATR15=%.2f ATR60=%.2f",
+                f"[{tag}] %s | regime=INDISPONIVEL | direction=%s | ADX15=%.2f ADX60=%.2f "
+                "ATR15=%.2f ATR60=%.2f | bloqueios=%s | resultado=%.2f pts / R$ %.2f",
                 snapshot["last_candle_time_15m"].strftime("%Y-%m-%d %H:%M"),
+                self._current_direction,
                 snapshot["adx15"],
                 snapshot["adx60"],
                 snapshot["atr15"],
                 snapshot["atr60"],
+                bloqueio,
+                self.risk.result_points,
+                result_reais,
             )
             return
 
         resumo = f"Macro {signal.macro}, contexto {signal.context15}"
         self.logger.info(
-            "[CANDLE15] %s | macro=%s | contexto15=%s | regime=%s | direction=%s | "
-            "ADX15=%.2f ADX60=%.2f ATR15=%.2f ATR60=%.2f EMA20=%.2f EMA50=%.2f | %s",
+            f"[{tag}] %s | macro=%s | contexto15=%s | regime=%s | direction=%s | "
+            "ADX15=%.2f ADX60=%.2f ATR15=%.2f ATR60=%.2f EMA20=%.2f EMA50=%.2f | "
+            "bloqueios=%s | resultado=%.2f pts / R$ %.2f | %s",
             snapshot["last_candle_time_15m"].strftime("%Y-%m-%d %H:%M"),
             signal.macro,
             signal.context15,
@@ -131,6 +141,9 @@ class TradingEngine:
             snapshot["atr60"],
             snapshot["ema20"],
             snapshot["ema50"],
+            bloqueio,
+            self.risk.result_points,
+            result_reais,
             resumo,
         )
 
@@ -141,17 +154,17 @@ class TradingEngine:
             return
         self._last_5m_log_marker = marker
 
-        regime = self.state.current_regime
-        last_15 = self._last_processed_candle.strftime("%H:%M") if self._last_processed_candle is not None else "N/A"
-        mt5_status = "OK" if self.connector.status.connected else "OFF"
-        thread_status = "ATIVA" if self.state.running else "INATIVA"
+        blocked, reason = self.can_trade()
+        bloqueio = reason if blocked else "Nenhum"
+        result_reais = points_to_reais(self.risk.result_points)
         self.logger.info(
-            "[INFO] %s | Regime atual: %s | Último 15m: %s | Thread: %s | MT5: %s",
+            "[INFO] %s | Regime: %s | Direção: %s | Bloqueio: %s | Resultado: %.2f pts / R$ %.2f",
             now.strftime("%H:%M"),
-            regime,
-            last_15,
-            thread_status,
-            mt5_status,
+            self.state.current_regime,
+            self._current_direction,
+            bloqueio,
+            self.risk.result_points,
+            result_reais,
         )
 
     def can_trade(self) -> tuple[bool, str]:
@@ -166,56 +179,45 @@ class TradingEngine:
         return blocked, reason
 
     def _evaluate_open_position(self, snapshot: dict) -> None:
-        """Atualiza posição simulada ativa com base no candle atual."""
         if not self.active_position:
             return
-
         pos = self.active_position
-        hit_stop = False
-        hit_take = False
-
         if pos.side == "BUY":
             hit_stop = snapshot["low_15m"] <= pos.stop_price
             hit_take = snapshot["high_15m"] >= pos.take_price
         else:
             hit_stop = snapshot["high_15m"] >= pos.stop_price
             hit_take = snapshot["low_15m"] <= pos.take_price
-
         if not hit_stop and not hit_take:
             return
-
         if hit_stop:
             result_points = -pos.stop_points
             self._signal("Stop atingido")
         else:
             result_points = pos.take_points
             self._signal("Alvo atingido")
-
         self.update_daily_result(result_points)
         self.active_position = None
 
     def _maybe_open_simulated_position(self, snapshot: dict) -> None:
-        """Abre posição simulada se todas regras de entrada forem satisfeitas."""
         if self.active_position is not None:
-            self._debug("Posição ativa em simulação; nova entrada bloqueada")
             return
 
         signal = self.regime_detector.classify(snapshot)
         self._last_signal = signal
+        self._current_direction = signal.direction
         self.state.current_regime = signal.regime
         self.state.blocked_reason = ""
 
         blocked, reason = self.can_trade()
         if blocked:
             self.state.blocked_reason = reason
-            self._debug(f"Bloqueado por: {reason}")
             return
 
         current_atr = snapshot["atr15"]
         if self.vol_filter.is_extreme(snapshot["atr_series"], current_atr):
             self.state.current_regime = "PAUSADO"
             self.state.blocked_reason = "Volatilidade extrema"
-            self._debug("Bloqueado por volatilidade extrema")
             return
 
         if signal.regime not in {"TENDENCIA_FORTE", "TENDENCIA_FRACA"}:
@@ -224,27 +226,14 @@ class TradingEngine:
         close_price = snapshot["close_15m"]
         adx_ok = snapshot["adx15"] > self.profile.adx_min
         volume_ok = snapshot["volume_15m"] > snapshot["volume_avg20"]
-
-        buy_signal = (
-            snapshot["ema20"] > snapshot["ema50"]
-            and adx_ok
-            and close_price > snapshot["breakout_high_5"]
-            and volume_ok
-        )
-        sell_signal = (
-            snapshot["ema20"] < snapshot["ema50"]
-            and adx_ok
-            and close_price < snapshot["breakout_low_5"]
-            and volume_ok
-        )
-
+        buy_signal = snapshot["ema20"] > snapshot["ema50"] and adx_ok and close_price > snapshot["breakout_high_5"] and volume_ok
+        sell_signal = snapshot["ema20"] < snapshot["ema50"] and adx_ok and close_price < snapshot["breakout_low_5"] and volume_ok
         if not buy_signal and not sell_signal:
             return
 
         side = "BUY" if buy_signal else "SELL"
         stop_points = self.profile.atr_multiplier * snapshot["atr15"]
         take_points = 2.0 * stop_points
-
         if side == "BUY":
             stop_price = close_price - stop_points
             take_price = close_price + take_points
@@ -252,42 +241,36 @@ class TradingEngine:
             stop_price = close_price + stop_points
             take_price = close_price - take_points
 
-        self.active_position = SimulatedPosition(
-            side=side,
-            entry_price=close_price,
-            stop_price=stop_price,
-            take_price=take_price,
-            stop_points=stop_points,
-            take_points=take_points,
-            opened_at=snapshot["last_candle_time_15m"],
-        )
+        self.active_position = SimulatedPosition(side, close_price, stop_price, take_price, stop_points, take_points, snapshot["last_candle_time_15m"])
         self.simulated_trades_opened += 1
-
         self._signal(
             f"{'COMPRA' if side == 'BUY' else 'VENDA'} | Entrada: {close_price:.2f} | "
             f"Stop: {stop_price:.2f} | Take: {take_price:.2f} | Risco pts: {stop_points:.2f}"
         )
 
     def process_market_snapshot(self, data: dict, contracts: int) -> None:
-        """Processa snapshot em modo simulação de sinais (sem ordem real)."""
         _ = contracts
         if getattr(self.profile, "simulation_mode", True):
             self._evaluate_open_position(data)
             self._maybe_open_simulated_position(data)
-            return
 
-    def run_loop(
-        self,
-        contracts: int,
-        status_callback: Callable[[str], None],
-        regime_callback: Callable[[str], None] | None = None,
-    ) -> None:
-        """Loop contínuo: executa somente em candle fechado de 15m."""
+    def _process_snapshot_event(self, contracts: int, snapshot: dict, tag: str) -> None:
+        self._last_processed_candle = snapshot["last_candle_time_15m"]
+        self.process_market_snapshot(snapshot, contracts)
+        self._log_15m_event(snapshot, tag=tag)
+
+    def run_loop(self, contracts: int, status_callback: Callable[[str], None], regime_callback: Callable[[str], None] | None = None) -> None:
         self.state.running = True
         self._stop_event.clear()
-        self._debug("Thread do engine iniciada")
-        self._debug("Loop ativo")
         status_callback("ENGINE RODANDO")
+
+        # Snapshot inicial (evento de start)
+        initial_snapshot = self.connector.build_market_snapshot(self.symbol)
+        if initial_snapshot:
+            self._process_snapshot_event(contracts, initial_snapshot, tag="INIT")
+            status_callback(f"Regime: {self.state.current_regime}")
+            if regime_callback:
+                regime_callback(self.state.current_regime)
 
         while not self._stop_event.is_set():
             try:
@@ -295,34 +278,33 @@ class TradingEngine:
                 if not connected:
                     status_callback("DESCONECTADO")
                     self._log_5m_heartbeat()
-                    time.sleep(2)
+                    time.sleep(1)
                     continue
 
                 self._log_5m_heartbeat()
 
                 blocked, reason = self.can_trade()
                 if blocked and reason == "Fora do horário operacional (10:00–17:00).":
-                    self.logger.info(reason)
-                    self._debug("Fora do horário operacional")
                     status_callback("AGUARDANDO HORÁRIO")
-                    time.sleep(5)
+                    time.sleep(1)
+                    continue
+
+                last_15m = self.connector.get_last_candle_time_15m(self.symbol)
+                if last_15m is None or self._last_processed_candle == last_15m:
+                    time.sleep(1)
                     continue
 
                 snapshot = self.connector.build_market_snapshot(self.symbol)
                 if not snapshot:
-                    time.sleep(2)
+                    time.sleep(1)
                     continue
 
-                candle_time = snapshot["last_candle_time_15m"]
-                if self._last_processed_candle == candle_time:
-                    time.sleep(2)
+                # garante processamento apenas em evento de novo candle 15m
+                if self._last_processed_candle == snapshot["last_candle_time_15m"]:
+                    time.sleep(1)
                     continue
 
-                self._last_processed_candle = candle_time
-                self._debug(f"Novo candle 15m detectado: {candle_time.strftime('%H:%M')}")
-
-                self.process_market_snapshot(snapshot, contracts)
-                self._log_15m_event(snapshot)
+                self._process_snapshot_event(contracts, snapshot, tag="CANDLE15")
                 status_callback(f"Regime: {self.state.current_regime}")
                 if regime_callback:
                     regime_callback(self.state.current_regime)
@@ -330,31 +312,16 @@ class TradingEngine:
                 time.sleep(1)
             except Exception as exc:
                 self.logger.exception("Erro no loop principal: %s", exc)
-                self._debug(f"Erro de loop: {exc}")
                 status_callback("ERRO NO LOOP")
-                time.sleep(2)
+                time.sleep(1)
 
         self.state.running = False
-        self._debug("Evento stop recebido")
-        self._debug("Thread encerrada")
         status_callback("ENGINE PARADA")
 
-    def start(
-        self,
-        contracts: int,
-        status_callback: Callable[[str], None],
-        regime_callback: Callable[[str], None] | None = None,
-    ) -> None:
-        """Inicia loop contínuo em thread separada."""
+    def start(self, contracts: int, status_callback: Callable[[str], None], regime_callback: Callable[[str], None] | None = None) -> None:
         if self.state.running:
             return
-        self._debug("Thread do engine iniciada")
-        self._thread = threading.Thread(
-            target=self.run_loop,
-            args=(contracts, status_callback, regime_callback),
-            daemon=True,
-            name="win-engine-loop",
-        )
+        self._thread = threading.Thread(target=self.run_loop, args=(contracts, status_callback, regime_callback), daemon=True, name="win-engine-loop")
         self._thread.start()
         self._log_startup(contracts)
 

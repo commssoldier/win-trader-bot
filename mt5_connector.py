@@ -105,6 +105,14 @@ class MT5Connector:
             self._status.connected = True
         return connected
 
+    def get_last_candle_time_15m(self, symbol: str) -> Optional[pd.Timestamp]:
+        """Retorna horário do último candle 15m sem recalcular indicadores."""
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 1)
+        if rates is None or len(rates) == 0:
+            self._debug(f"Sem candle 15m disponível para {symbol}")
+            return None
+        return pd.to_datetime(rates[0]["time"], unit="s")
+
     def get_rates_dataframe(self, symbol: str, timeframe: int, bars: int = 300) -> Optional[pd.DataFrame]:
         """Busca candles e retorna DataFrame com índice temporal."""
         rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
