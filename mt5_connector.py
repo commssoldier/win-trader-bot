@@ -220,7 +220,7 @@ class MT5Connector:
             "ema20_15_prev3": float(df15["ema20"].iloc[-4]),
             "atr15": float(latest15["atr14"]),
             "atr15_prev": float(prev15["atr14"]),
-            "atr15_mean20": float(df15["atr14"].tail(20).mean()),
+            "atr15_mean30": float(df15["atr14"].tail(30).mean()),
             "adx15": float(latest15["adx14"]),
             "ema20_60": float(latest60["ema20"]),
             "ema50_60": float(latest60["ema50"]),
@@ -235,4 +235,8 @@ class MT5Connector:
             "ema_distance_atr": abs(float(latest15["ema20"] - latest15["ema50"])) / max(float(latest15["atr14"]), 1e-9),
             "macro_aligned": bool((latest60["ema20"] > latest60["ema50"] and latest15["ema20"] > latest15["ema50"]) or (latest60["ema20"] < latest60["ema50"] and latest15["ema20"] < latest15["ema50"])),
             "rejection_5m": bool((latest5["close"] > latest5["open"] and latest5["low"] < min(latest5["open"], latest5["close"])) or (latest5["close"] < latest5["open"] and latest5["high"] > max(latest5["open"], latest5["close"]))),
+            "high_series_15": df15["high"].tail(120).astype("float64").tolist(),
+            "low_series_15": df15["low"].tail(120).astype("float64").tolist(),
+            "high_series_60": df60["high"].tail(120).astype("float64").tolist(),
+            "low_series_60": df60["low"].tail(120).astype("float64").tolist(),
         }

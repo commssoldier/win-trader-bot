@@ -113,7 +113,9 @@ class TradingEngine:
         sig = self._latest_signal
         self.logger.info(
             f"[{tag}] %s | macro=%s | contexto15=%s | regime=%s | direcao=%s | conf=%.3f | "
-            "ADX15=%.2f ADX60=%.2f ATR15=%.2f ATR60=%.2f | bloqueios=%s | resultado=%.2f pts / R$ %.2f",
+            "ADX15=%.2f ADX60=%.2f ATR15=%.2f ATR60=%.2f | pivots15=%s pivots60=%s | "
+            "estrutura15=%s estrutura60=%s | atr15_mean30=%.2f | dist_rel_ema=%.4f | "
+            "bloqueios=%s | resultado=%.2f pts / R$ %.2f",
             snap["last_candle_time_15m"].strftime("%Y-%m-%d %H:%M"),
             sig.macro,
             sig.context15,
@@ -124,6 +126,12 @@ class TradingEngine:
             snap["adx60"],
             snap["atr15"],
             snap["atr60"],
+            sig.pivot_count15,
+            sig.pivot_count60,
+            sig.structure15,
+            sig.structure60,
+            snap["atr15_mean30"],
+            sig.dist_rel_15,
             self._active_blocks(),
             self.risk.result_points,
             points_to_reais(self.risk.result_points),
@@ -147,6 +155,10 @@ class TradingEngine:
             return False, "context15"
         if signal.confidence_score < 0.75:
             return False, "confidence"
+
+        ema_gap = abs(snapshot["ema20_15"] - snapshot["ema50_15"])
+        if ema_gap <= (0.4 * snapshot["atr15"]):
+            return False, "ema_distance"
 
         close_15 = snapshot["close_15m"]
         high_15 = snapshot["high_15m"]
