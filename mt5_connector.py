@@ -92,9 +92,9 @@ class MT5Connector:
             self._debug("Shutdown MT5 executado")
 
     def ensure_connection(self) -> bool:
+        """Verifica conexão MT5 sem log por heartbeat; loga apenas transições."""
         terminal = mt5.terminal_info()
         connected = bool(terminal and terminal.connected)
-        self._debug(f"Verificação MT5 status.connected={connected}")
         if not connected and self._status.connected:
             self._offline_since = self._offline_since or datetime.now()
             self.logger.warning("Conexão MT5 perdida")
