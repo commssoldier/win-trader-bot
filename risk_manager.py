@@ -1,77 +1,75 @@
-"""Gestão matemática de risco e limites diários."""
+"""Gestão de risco do modelo Sniper Adaptativo."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from profile_manager import StrategyProfile
-from utils import max_contracts, points_to_reais, reais_to_points
+from utils import WIN_POINT_VALUE, max_contracts
+
+
+@dataclass(frozen=True)
+class RegimeRiskConfig:
+    risk_percent: float
+    allow_pullback: bool
+    allow_breakout: bool
+
+
+REGIME_RISK_MAP = {
+    "TENDENCIA_FORTE": RegimeRiskConfig(risk_percent=0.0075, allow_pullback=True, allow_breakout=True),
+    "TENDENCIA_FRACA": RegimeRiskConfig(risk_percent=0.0050, allow_pullback=True, allow_breakout=False),
+    "TRANSICAO": RegimeRiskConfig(risk_percent=0.0035, allow_pullback=True, allow_breakout=False),
+    "LATERAL": RegimeRiskConfig(risk_percent=0.0, allow_pullback=False, allow_breakout=False),
+}
 
 
 @dataclass
-class RiskLimits:
-    max_contracts: int
-    daily_target_reais: float
-    daily_stop_reais: float
-    daily_target_points: float
-    daily_stop_points: float
+class TradeLevels:
+    stop_points: float
+    take_points: float
+    trailing_trigger_points: float
+    trailing_distance_points: float
+
+
+@dataclass
+class PositionSizeResult:
+    contracts: int
+    risk_amount: float
 
 
 class RiskManager:
-    """Calcula limites e valida bloqueios diários."""
+    """Calcula tamanho de posição e níveis técnicos da estratégia única."""
 
-    def __init__(self, capital: float, profile: StrategyProfile) -> None:
+    def __init__(self, capital: float) -> None:
         self.capital = capital
-        self.profile = profile
         self.result_points = 0.0
-        self.consecutive_losses = 0
-        self.trade_count = 0
-        self.expansion_enabled = False
-        self.expansion_applied = False
-        self.expansion_trades_left = 0
-
-    def limits(self) -> RiskLimits:
-        target_reais = self.capital * self.profile.daily_target_pct
-        stop_reais = self.capital * self.profile.daily_stop_pct
-        return RiskLimits(
-            max_contracts=max_contracts(self.capital),
-            daily_target_reais=target_reais,
-            daily_stop_reais=stop_reais,
-            daily_target_points=reais_to_points(target_reais),
-            daily_stop_points=reais_to_points(stop_reais),
-        )
-
-    def risk_trade_points(self) -> float:
-        return reais_to_points(self.capital * self.profile.risk_per_trade_pct)
-
-    def compute_stop_take_points(self, atr15: float) -> tuple[float, float]:
-        stop_atr = atr15 * self.profile.atr_multiplier
-        stop_final = min(stop_atr, self.risk_trade_points())
-        take = stop_final * self.profile.reward_multiplier
-        return stop_final, take
 
     def register_trade_result(self, result_points: float) -> None:
         self.result_points += result_points
-        self.trade_count += 1
-        result_reais = points_to_reais(result_points)
-        self.consecutive_losses = self.consecutive_losses + 1 if result_reais < 0 else 0
-        if self.expansion_applied and self.expansion_trades_left > 0:
-            self.expansion_trades_left -= 1
-            if result_reais < 0 and self.expansion_trades_left == 1:
-                self.expansion_trades_left = 0
 
-    def should_block(self) -> tuple[bool, str]:
-        limits = self.limits()
-        result_reais = points_to_reais(self.result_points)
-        if result_reais >= limits.daily_target_reais and not self.expansion_applied:
-            return True, "Meta diária atingida"
-        if result_reais <= -limits.daily_stop_reais:
-            return True, "Stop diário atingido"
-        if self.consecutive_losses >= self.profile.consecutive_losses_limit:
-            return True, "Limite de perdas consecutivas"
-        if self.trade_count >= self.profile.max_trades_per_day + self.expansion_trades_left:
-            return True, "Máximo de trades do dia"
-        return False, ""
+    @staticmethod
+    def calculate_position_size(balance: float, risk_percent: float, stop_points: float) -> PositionSizeResult:
+        """Retorna contratos pelo risco financeiro e stop em pontos."""
+        if balance <= 0 or risk_percent <= 0 or stop_points <= 0:
+            return PositionSizeResult(contracts=0, risk_amount=0.0)
 
-    def apply_expansion(self) -> None:
-        self.expansion_applied = True
-        self.expansion_trades_left = 2
+        risk_amount = balance * risk_percent
+        risk_per_contract = stop_points * WIN_POINT_VALUE
+        if risk_per_contract <= 0:
+            return PositionSizeResult(contracts=0, risk_amount=risk_amount)
+
+        contracts = int(risk_amount // risk_per_contract)
+        contracts = max(0, min(contracts, max_contracts(balance)))
+        return PositionSizeResult(contracts=contracts, risk_amount=risk_amount)
+
+    @staticmethod
+    def build_trade_levels(atr15: float) -> TradeLevels:
+        stop_points = 1.2 * atr15
+        take_points = 2.0 * stop_points
+        return TradeLevels(
+            stop_points=stop_points,
+            take_points=take_points,
+            trailing_trigger_points=stop_points,
+            trailing_distance_points=atr15,
+        )
+
+    def regime_config(self, regime: str) -> RegimeRiskConfig:
+        return REGIME_RISK_MAP.get(regime, REGIME_RISK_MAP["LATERAL"])

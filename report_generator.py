@@ -9,21 +9,17 @@ from execution_manager import ExecutedTrade
 
 
 class ReportGenerator:
-    """Exporta relatório diário do WIN em CSV."""
-
     def __init__(self, base_dir: str = "reports") -> None:
         self.base = Path(base_dir)
 
     def generate_daily_report(
         self,
         report_date: date,
-        profile_name: str,
+        strategy_name: str,
         capital: float,
         result_reais: float,
         result_points: float,
         trades: list[ExecutedTrade],
-        meta_hit: bool,
-        stop_hit: bool,
         drawdown: float,
         offline_count: int,
         offline_duration_min: float,
@@ -37,13 +33,11 @@ class ReportGenerator:
             writer = csv.writer(fp)
             writer.writerow(["Resumo geral"])
             writer.writerow(["Data", report_date.isoformat()])
-            writer.writerow(["Perfil", profile_name])
+            writer.writerow(["Estratégia", strategy_name])
             writer.writerow(["Capital inicial", f"{capital:.2f}"])
             writer.writerow(["Resultado (R$)", f"{result_reais:.2f}"])
             writer.writerow(["Resultado (pontos)", f"{result_points:.2f}"])
             writer.writerow(["Win rate", f"{win_rate:.2f}%"])
-            writer.writerow(["Meta atingida", "Sim" if meta_hit else "Não"])
-            writer.writerow(["Stop disparado", "Sim" if stop_hit else "Não"])
             writer.writerow(["Drawdown máximo (R$)", f"{drawdown:.2f}"])
             writer.writerow(["Conexões offline", offline_count])
             writer.writerow(["Tempo offline (min)", f"{offline_duration_min:.2f}"])

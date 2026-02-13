@@ -1,4 +1,4 @@
-"""Classificação hierárquica de regime de mercado (60m + 15m + 5m timing)."""
+"""Classificação hierárquica de regime (60m + 15m) para o Sniper Adaptativo."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,72 +11,54 @@ class RegimeSignal:
     context15: str
     regime: str
     direction: str
-    details: str
+    confidence_score: float
 
 
 class RegimeDetector:
-    """Classifica regime com arquitetura determinística hierárquica."""
-
     def __init__(self, debug_mode: bool = False, debug_callback: Callable[[str], None] | None = None) -> None:
         self.debug_mode = debug_mode
         self._debug_callback = debug_callback
 
     def _debug(self, message: str) -> None:
-        if not self.debug_mode:
-            return
-        payload = f"[DEBUG] {message}"
-        if self._debug_callback:
-            self._debug_callback(payload)
+        if self.debug_mode and self._debug_callback:
+            self._debug_callback(f"[DEBUG] {message}")
 
     @staticmethod
     def ema_distance_relative_atr(ema_fast: float, ema_slow: float, atr: float) -> float:
-        """Retorna distância relativa das EMAs em unidades de ATR."""
-        if atr <= 0:
-            return 0.0
-        return abs(ema_fast - ema_slow) / atr
+        return abs(ema_fast - ema_slow) / atr if atr > 0 else 0.0
 
     @staticmethod
     def ema_slope_relative_atr(ema_now: float, ema_prev_n: float, atr: float) -> float:
-        """Retorna inclinação relativa da EMA em unidades de ATR."""
-        if atr <= 0:
-            return 0.0
-        return (ema_now - ema_prev_n) / atr
+        return (ema_now - ema_prev_n) / atr if atr > 0 else 0.0
 
-    def classify_macro(self, adx60: float, ema20_60: float, ema50_60: float, atr60: float, ema20_60_prev3: float) -> str:
-        dist_rel = self.ema_distance_relative_atr(ema20_60, ema50_60, atr60)
-        slope_rel = self.ema_slope_relative_atr(ema20_60, ema20_60_prev3, atr60)
+    def classify_macro(self, data: dict) -> str:
+        adx60 = data["adx60"]
+        atr60 = data["atr60"]
+        dist_rel = self.ema_distance_relative_atr(data["ema20_60"], data["ema50_60"], atr60)
+        slope_rel = self.ema_slope_relative_atr(data["ema20_60"], data["ema20_60_prev3"], atr60)
 
         self._debug(
             f"Macro60 | ADX60={adx60:.2f} ATR60={atr60:.2f} dist_rel={dist_rel:.4f} slope_rel={slope_rel:.4f}"
         )
 
-        macro_tendencia = adx60 > 25 and dist_rel > 0.15 and abs(slope_rel) > 0.2
-        macro_lateral = adx60 < 20 or dist_rel < 0.1
-
-        if macro_tendencia:
+        if adx60 > 25 and dist_rel > 0.15 and abs(slope_rel) > 0.2:
             return "MACRO_TENDENCIA"
-        if macro_lateral:
+        if adx60 < 20 or dist_rel < 0.1:
             return "MACRO_LATERAL"
         return "MACRO_TRANSICAO"
 
-    def classify_context15(
-        self,
-        adx15: float,
-        ema20_15: float,
-        ema50_15: float,
-        atr15: float,
-        ema20_15_prev3: float,
-        atr15_mean20: float,
-        atr15_prev: float,
-    ) -> str:
-        dist_rel = self.ema_distance_relative_atr(ema20_15, ema50_15, atr15)
-        slope_rel = self.ema_slope_relative_atr(ema20_15, ema20_15_prev3, atr15)
-        atr_expansion = atr15 > atr15_prev and atr15 > atr15_mean20
+    def classify_context15(self, data: dict) -> str:
+        adx15 = data["adx15"]
+        atr15 = data["atr15"]
+        dist_rel = self.ema_distance_relative_atr(data["ema20"], data["ema50"], atr15)
+        slope_rel = self.ema_slope_relative_atr(data["ema20"], data["ema20_15_prev3"], atr15)
+        atr_expansion = data["atr15"] > data["atr15_prev"] and data["atr15"] > data["atr15_mean20"]
 
         self._debug(
             "Ctx15 | "
-            f"ADX15={adx15:.2f} ATR15={atr15:.2f} ATR15_mean20={atr15_mean20:.2f} ATR15_prev={atr15_prev:.2f} "
-            f"dist_rel={dist_rel:.4f} slope_rel={slope_rel:.4f} atr_expansion={atr_expansion}"
+            f"ADX15={adx15:.2f} ATR15={atr15:.2f} ATR15_mean20={data['atr15_mean20']:.2f} "
+            f"ATR15_prev={data['atr15_prev']:.2f} dist_rel={dist_rel:.4f} slope_rel={slope_rel:.4f} "
+            f"atr_expansion={atr_expansion}"
         )
 
         if adx15 > 25 and dist_rel > 0.2 and abs(slope_rel) > 0.15:
@@ -84,51 +66,47 @@ class RegimeDetector:
         if 20 < adx15 <= 25 and dist_rel > 0.12:
             return "TENDENCIA_FRACA"
         if adx15 < 20 and atr_expansion:
-            return "LATERAL_VOLATIL"
-        if adx15 < 18 and atr15 < atr15_mean20:
-            return "LATERAL_COMPRESSIVA"
+            return "LATERAL"
+        if adx15 < 18 and data["atr15"] < data["atr15_mean20"]:
+            return "LATERAL"
         return "TRANSICAO"
 
+    @staticmethod
+    def _confidence(adx15: float, adx60: float, dist_rel_15: float, dist_rel_60: float, regime: str) -> float:
+        if regime == "LATERAL":
+            base = max(0.0, (20 - adx15) / 20)
+            return round(min(1.0, 0.5 + base / 2), 3)
+        raw = (min(adx15, 40) / 40) * 0.5 + (min(adx60, 40) / 40) * 0.3 + min(dist_rel_15 + dist_rel_60, 2.0) * 0.1
+        return round(max(0.0, min(1.0, raw)), 3)
+
     def combine(self, macro: str, context15: str) -> str:
+        if context15 == "LATERAL":
+            return "LATERAL"
+        if macro == "MACRO_TRANSICAO" or context15 == "TRANSICAO":
+            return "TRANSICAO"
         if macro == "MACRO_TENDENCIA" and context15 == "TENDENCIA_FORTE":
             return "TENDENCIA_FORTE"
-        if macro == "MACRO_LATERAL" and context15 == "LATERAL_VOLATIL":
-            return "LATERAL_VOLATIL"
-        if context15 == "LATERAL_COMPRESSIVA":
-            return "COMPRESSAO"
-        if "TRANSICAO" in macro or context15 == "TRANSICAO":
-            return "TRANSICAO"
-        return "TENDENCIA_FRACA"
+        if context15 in {"TENDENCIA_FORTE", "TENDENCIA_FRACA"}:
+            return "TENDENCIA_FRACA"
+        return "LATERAL"
 
     def classify(self, data: dict) -> RegimeSignal:
-        """Classifica regime final combinando macro 60m e contexto 15m."""
-        macro = self.classify_macro(
-            adx60=data["adx60"],
-            ema20_60=data["ema20_60"],
-            ema50_60=data["ema50_60"],
-            atr60=data["atr60"],
-            ema20_60_prev3=data["ema20_60_prev3"],
-        )
-
-        context15 = self.classify_context15(
-            adx15=data["adx15"],
-            ema20_15=data["ema20"],
-            ema50_15=data["ema50"],
-            atr15=data["atr15"],
-            ema20_15_prev3=data["ema20_15_prev3"],
-            atr15_mean20=data["atr15_mean20"],
-            atr15_prev=data["atr15_prev"],
-        )
-
+        macro = self.classify_macro(data)
+        context15 = self.classify_context15(data)
         regime = self.combine(macro, context15)
+
         direction = "NEUTRO"
         if data["ema20"] > data["ema50"]:
             direction = "COMPRA"
         elif data["ema20"] < data["ema50"]:
             direction = "VENDA"
 
+        dist_rel_15 = self.ema_distance_relative_atr(data["ema20"], data["ema50"], data["atr15"])
+        dist_rel_60 = self.ema_distance_relative_atr(data["ema20_60"], data["ema50_60"], data["atr60"])
+        confidence_score = self._confidence(data["adx15"], data["adx60"], dist_rel_15, dist_rel_60, regime)
+
         self._debug(
-            f"Regime final | macro={macro} context15={context15} regime={regime} direction={direction}"
+            f"Regime final | macro={macro} context15={context15} regime={regime} direction={direction} confidence={confidence_score:.3f}"
         )
 
         return RegimeSignal(
@@ -136,5 +114,5 @@ class RegimeDetector:
             context15=context15,
             regime=regime,
             direction=direction,
-            details=f"macro={macro} context15={context15}",
+            confidence_score=confidence_score,
         )
